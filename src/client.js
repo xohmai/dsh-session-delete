@@ -33,7 +33,17 @@ window.__ModuleLoader__.load({
       .sd-btn:active:not(:disabled) { transform: scale(.96) }
       .sd-btn:disabled { opacity: .55; cursor: default }
       .sd-spin { display: inline-block; animation: sdSpin .8s linear infinite }
+      /* 列表行：行间真实间距让相邻的选中背景彼此分开；选中/悬停样式统一在类里，
+       * 避免 inline style 压掉 :hover（选中行悬停加深的反馈不能丢）。 */
+      .sd-row { border-radius: 6px; margin-bottom: 3px }
       .sd-row:hover { background: color-mix(in srgb, var(--dsw-alias-label-secondary) 7%, transparent) }
+      .sd-row.sd-sel {
+        background: color-mix(in srgb, var(--dsw-alias-brand-primary) 7%, transparent);
+        box-shadow: inset 3px 0 0 var(--dsw-alias-brand-primary);
+      }
+      .sd-row.sd-sel:hover {
+        background: color-mix(in srgb, var(--dsw-alias-brand-primary) 12%, transparent);
+      }
       /*
        * 滚动让渡：官方设置面板把 section 内容放进 .options 容器（overflow-y:auto、
        * 普通 block）——按设计各 section 整体长高、容器滚动，tab 栏会跟着滚走。
@@ -522,21 +532,21 @@ window.__ModuleLoader__.load({
       const selectedBytes = (rows) => rows.filter((s) => selected.has(s.id)).reduce((acc, s) => acc + (s.sizeBytes ?? 0), 0)
 
       // ---------- 行渲染 ----------
-      /** 会话行：整行可点击切换选中（复选框/操作按钮自身阻止冒泡）。 */
-      const sessionRow = (s, opts) =>
-        h(
+      /** 会话行：整行可点击切换选中（复选框/操作按钮自身阻止冒泡）。选中态样式见 .sd-sel。 */
+      const sessionRow = (s, opts) => {
+        const isSel = selected.has(s.id)
+        return h(
           'div',
           {
             key: s.id,
-            className: 'sd-row',
+            className: isSel ? 'sd-row sd-sel' : 'sd-row',
             style: {
               display: 'flex',
               alignItems: 'center',
               gap: 8,
-              padding: opts?.indent ? '4px 6px 4px 26px' : '4px 6px',
-              borderRadius: 6,
+              padding: opts?.indent ? '4px 6px 4px 22px' : '4px 6px 4px 10px',
               cursor: 'pointer',
-              background: selected.has(s.id) ? 'color-mix(in srgb, var(--dsw-alias-brand-primary) 9%, transparent)' : undefined,
+              minHeight: 32,
             },
             onClick: () => toggle(s.id),
           },
@@ -573,11 +583,12 @@ window.__ModuleLoader__.load({
               : null,
           ].filter(Boolean),
         )
+      }
 
       const trashRow = (it) =>
         h(
           'div',
-          { key: it.entry, className: 'sd-row', style: { display: 'flex', alignItems: 'center', gap: 8, padding: '5px 6px', borderRadius: 6 } },
+          { key: it.entry, className: 'sd-row', style: { display: 'flex', alignItems: 'center', gap: 8, padding: '5px 6px 5px 10px', minHeight: 32 } },
           [
             h(
               'span',
@@ -640,7 +651,7 @@ window.__ModuleLoader__.load({
                       h('span', { key: 'n', style: { fontSize: 13, fontWeight: 600, color: T.label, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, title: meta.path }, meta.name),
                       h('span', { key: 'i', style: { fontSize: 12, color: T.secondary } }, `${groupSessions.length} 会话 · ${fmtSize(groupSessions.reduce((a, s) => a + (s.sizeBytes ?? 0), 0))}`),
                     ]),
-                    ...groupSessions.map((s) => sessionRow(s, { indent: true })),
+                    ...groupSessions.map((s) => sessionRow(s, { indent: true, singleDelete: true })),
                   ],
                 )
               }),
