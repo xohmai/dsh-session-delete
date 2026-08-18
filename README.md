@@ -38,3 +38,13 @@ dsh plugin --profile web add ./dsh-session-delete-0.1.0.tgz
 ```sh
 node tools/unhide.mjs <sessionId>
 ```
+
+## 开发
+
+```sh
+npm test   # node test/smoke.mjs && node test/render.mjs
+```
+
+## License
+
+Apache-2.0
