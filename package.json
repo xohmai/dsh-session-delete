@@ -1,0 +1,38 @@
+{
+  "name": "dsh-session-delete",
+  "version": "0.1.0",
+  "description": "Real session deletion for DeepSeek Harness: settings-page manager with trash & restore, archived-session cleanup, and batch delete",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "cordis",
+    "session-management"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xohmai/dsh-session-delete.git"
+  },
+  "exports": {
+    ".": "./src/index.js",
+    "./client": "./src/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "tools",
+    "cordis.patch.yml"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": []
+    }
+  }
+}

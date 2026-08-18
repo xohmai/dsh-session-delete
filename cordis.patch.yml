@@ -1,0 +1,6 @@
+# dsh-session-delete bundle patch: one insert adding the host row. The client
+# half joins the browser graph automatically because package.json declares
+# dsh.client and exports "./client".
+- insert:
+    - id: session-delete
+      name: dsh-session-delete
