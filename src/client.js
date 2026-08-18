@@ -44,6 +44,23 @@ window.__ModuleLoader__.load({
       .sd-row.sd-sel:hover {
         background: color-mix(in srgb, var(--dsw-alias-brand-primary) 12%, transparent);
       }
+      /* 工作区分组头：标签化（小一号/加粗/次要色），吸顶 + 底部分隔线——
+       * 长列表滚动时分组归属始终可见；与 13px/常规/主色的会话行形成清晰层级。 */
+      .sd-grouphd {
+        position: sticky;
+        top: 0;
+        z-index: 1;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 7px 6px 5px 10px;
+        margin-top: 8px;
+        border-bottom: 1px solid var(--dsw-alias-border-l1);
+        background: var(--dsw-alias-bg-layer-2);
+        cursor: pointer;
+      }
+      .sd-grouphd:first-child { margin-top: 0 }
+      .sd-grouphd:hover { background: color-mix(in srgb, var(--dsw-alias-label-secondary) 5%, transparent) }
       /*
        * 滚动让渡：官方设置面板把 section 内容放进 .options 容器（overflow-y:auto、
        * 普通 block）——按设计各 section 整体长高、容器滚动，tab 栏会跟着滚走。
@@ -637,7 +654,7 @@ window.__ModuleLoader__.load({
                   [
                     h('div', {
                       key: 'h',
-                      style: { display: 'flex', alignItems: 'center', gap: 8, padding: '8px 4px 4px', cursor: 'pointer', borderRadius: 6 },
+                      className: 'sd-grouphd',
                       onClick: () => toggleGroup(groupSessions),
                     }, [
                       h('input', {
@@ -646,10 +663,10 @@ window.__ModuleLoader__.load({
                         checked: groupSessions.every((s) => selected.has(s.id)),
                         onChange: () => toggleGroup(groupSessions),
                         onClick: (e) => e.stopPropagation(),
-                        style: { accentColor: T.brand, cursor: 'pointer' },
+                        style: { accentColor: T.brand, cursor: 'pointer', flexShrink: 0 },
                       }),
-                      h('span', { key: 'n', style: { fontSize: 13, fontWeight: 600, color: T.label, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, title: meta.path }, meta.name),
-                      h('span', { key: 'i', style: { fontSize: 12, color: T.secondary } }, `${groupSessions.length} 会话 · ${fmtSize(groupSessions.reduce((a, s) => a + (s.sizeBytes ?? 0), 0))}`),
+                      h('span', { key: 'n', style: { fontSize: 12, fontWeight: 600, color: T.secondary, letterSpacing: 0.3, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, title: meta.path }, meta.name),
+                      h('span', { key: 'i', style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary, var(--dsw-alias-label-secondary))', flexShrink: 0 } }, `${groupSessions.length} 会话 · ${fmtSize(groupSessions.reduce((a, s) => a + (s.sizeBytes ?? 0), 0))}`),
                     ]),
                     ...groupSessions.map((s) => sessionRow(s, { indent: true, singleDelete: true })),
                   ],
