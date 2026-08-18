@@ -9,12 +9,23 @@ DSH（DeepSeek Harness）会话删除插件：官方「归档」只把会话移�
 
 ## 安装
 
+`dsh plugin add` 会自动完成依赖链接与 profile 注册，装完重启 `dsh web` 生效。卸载：`dsh plugin --profile web remove dsh-session-delete`。
+
+**方式一：GitHub 直装（推荐）**
+
 ```sh
 dsh plugin --profile web add github:xohmai/dsh-session-delete
-# 或发布 npm 后：dsh plugin --profile web add dsh-session-delete
+# 锁定版本更安全：github:xohmai/dsh-session-delete#<commit-sha>
 ```
 
-装完重启 `dsh web` 生效。卸载：`dsh plugin --profile web remove dsh-session-delete`。
+本插件零构建（纯 JS，无 TypeScript / 无打包步骤），git 安装不会踩「源码拉下来没跑 build」的坑，也无需 pnpm allowBuilds 授权。
+
+**方式二：tarball 离线分发（内网场景）**
+
+```sh
+npm pack                                               # 产出 dsh-session-delete-0.1.0.tgz
+dsh plugin --profile web add ./dsh-session-delete-0.1.0.tgz
+```
 
 ## 使用
 
