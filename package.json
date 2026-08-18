@@ -40,5 +40,8 @@
       "platform": "web",
       "inject": []
     }
+  },
+  "engines": {
+    "node": ">=20"
   }
 }
