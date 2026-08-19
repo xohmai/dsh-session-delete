@@ -299,8 +299,11 @@ window.__ModuleLoader__.load({
       const [list, setList] = useState(null)
       const [workspaces, setWorkspaces] = useState([])
       const [trash, setTrash] = useState(null)
-      const [loading, setLoading] = useState(false)
-      const [error, setError] = useState(null)
+      // 按数据域独立的加载/错误状态：回收站后台刷新不会干扰会话页签的按钮与错误提示
+      const [listLoading, setListLoading] = useState(false)
+      const [listError, setListError] = useState(null)
+      const [trashLoading, setTrashLoading] = useState(false)
+      const [trashError, setTrashError] = useState(null)
       const [query, setQuery] = useState('')
       const [filter, setFilter] = useState('active') // active | archived | stale30 | all（仅 all 页签）
       const [selected, setSelected] = useState(new Set())
@@ -318,28 +321,28 @@ window.__ModuleLoader__.load({
       }, [notice?.at])
 
       async function loadList() {
-        setLoading(true)
-        setError(null)
+        setListLoading(true)
+        setListError(null)
         try {
           const data = await api(`${PREFIX}/list`)
           setList(data.sessions ?? [])
           setWorkspaces(data.workspaces ?? [])
         } catch (e) {
-          setError(String(e?.message ?? e))
+          setListError(String(e?.message ?? e))
         } finally {
-          setLoading(false)
+          setListLoading(false)
         }
       }
       async function loadTrash() {
-        setLoading(true)
-        setError(null)
+        setTrashLoading(true)
+        setTrashError(null)
         try {
           const data = await api(`${PREFIX}/trash`)
           setTrash(data.items ?? [])
         } catch (e) {
-          setError(String(e?.message ?? e))
+          setTrashError(String(e?.message ?? e))
         } finally {
-          setLoading(false)
+          setTrashLoading(false)
         }
       }
 
@@ -350,7 +353,11 @@ window.__ModuleLoader__.load({
         // 页签切入总是重拉：/trash 毫秒级、/list 有宿主 mtime 缓存，均为无感刷新；
         // 若只在 null 时加载，删除/还原后切回页签会展示陈旧列表。
         if (tab === 'trash') loadTrash()
-        else loadList()
+        else {
+          loadList()
+          // 预载回收站计数：首开即有「回收站 (N)」徽标，删除后能立即递增
+          if (trash === null) loadTrash()
+        }
       }, [tab])
 
       // 4 秒未确认自动解除武装
@@ -638,7 +645,7 @@ window.__ModuleLoader__.load({
 
       // ---------- 页签内容（仅滚动列表区） ----------
       function ArchivedTab() {
-        if (loading && list === null) return h('div', { style: { fontSize: 13, color: T.secondary, padding: '8px 0' } }, '加载中…')
+        if (listLoading && list === null) return h('div', { style: { fontSize: 13, color: T.secondary, padding: '8px 0' } }, '加载中…')
         if (archivedSessions.length === 0) {
           return h('div', { style: { fontSize: 13, color: T.secondary, padding: '8px 0', lineHeight: '20px' } }, [
             h('div', { key: 'a' }, '没有已归档的会话。'),
@@ -649,7 +656,7 @@ window.__ModuleLoader__.load({
       }
 
       function AllTab() {
-        if (loading && list === null) return h('div', { style: { fontSize: 13, color: T.secondary, padding: '8px 0' } }, '加载中…')
+        if (listLoading && list === null) return h('div', { style: { fontSize: 13, color: T.secondary, padding: '8px 0' } }, '加载中…')
         if (sessions.length === 0) return h('div', { style: { fontSize: 13, color: T.secondary, padding: '8px 0' } }, '没有可列出的会话')
         return h(
           'div',
@@ -686,7 +693,7 @@ window.__ModuleLoader__.load({
       }
 
       function TrashTab() {
-        if (loading && trash === null) return h('div', { style: { fontSize: 13, color: T.secondary, padding: '8px 0' } }, '加载中…')
+        if (trashLoading && trash === null) return h('div', { style: { fontSize: 13, color: T.secondary, padding: '8px 0' } }, '加载中…')
         const items = trash ?? []
         return h(
           'div',
@@ -803,12 +810,12 @@ window.__ModuleLoader__.load({
             ),
             h(
               'button',
-              { key: 'r', className: 'sd-btn', style: { ...smallBtn, marginLeft: 'auto' }, disabled: busy || loading, title: '重新加载', onClick: () => (tab === 'trash' ? loadTrash() : loadList()) },
-              h('span', { className: loading || busy ? 'sd-spin' : undefined }, '↻'),
+              { key: 'r', className: 'sd-btn', style: { ...smallBtn, marginLeft: 'auto' }, disabled: busy || (tab === 'trash' ? trashLoading : listLoading), title: '重新加载', onClick: () => (tab === 'trash' ? loadTrash() : loadList()) },
+              h('span', { className: (tab === 'trash' ? trashLoading : listLoading) || busy ? 'sd-spin' : undefined }, '↻'),
             ),
           ]),
           h(Toolbar, { key: 'tb' }),
-          error ? h('div', { key: 'err', style: { fontSize: 13, color: T.err, padding: '8px 0', flex: 'none' } }, error) : null,
+          (tab === 'trash' ? trashError : listError) ? h('div', { key: 'err', style: { fontSize: 13, color: T.err, padding: '8px 0', flex: 'none' } }, tab === 'trash' ? trashError : listError) : null,
           h(NoticeBanner, { key: 'notice', notice, onClose: () => setNotice(null) }),
           h(
             'div',

@@ -265,6 +265,45 @@ const P = '/api/session-delete'
       assert.equal(r.status, 400)
     })
 
+    await test('回收站条目路径穿越防护：entry=".." / "." / "audit.log" 全部拒绝', async () => {
+      // 先删一个会话制造回收站内容，确保攻击发生时目标确实存在
+      await createSession('session-cccc4444-0000-4000-8000-000000000004', cwdA, 100)
+      const rDel = res()
+      await routes.get(`${P}/delete`)(bodyReq('POST', `${P}/delete`, { id: 'session-cccc4444-0000-4000-8000-000000000004' }), rDel)
+      assert.equal(rDel.status, 200)
+      headers.splice(headers.findIndex((x) => x.id === 'session-cccc4444-0000-4000-8000-000000000004'), 1)
+
+      for (const evil of ['..', '.', 'audit.log']) {
+        for (const path of ['/purge', '/restore']) {
+          const r = res()
+          await routes.get(`${P}${path}`)(bodyReq('POST', `${P}${path}`, { entry: evil }), r)
+          assert.equal(r.status, 400, `${path} entry=${evil} 应 400，实际 ${r.status}`)
+        }
+      }
+      // 审计日志必须仍然存在（未被当作条目删除）
+      const audit = await readFile(join(home, 'trash', 'sessions', 'audit.log'), 'utf8')
+      assert.ok(audit.includes('session-cccc4444'))
+      // 清理该条目
+      const rT = res()
+      await routes.get(`${P}/trash`)(get(`${P}/trash`), rT)
+      await routes.get(`${P}/purge`)(bodyReq('POST', `${P}/purge`, { entry: rT.body.items[0].entry }), res())
+    })
+
+    await test('畸形 JSON 请求体 → 400（而非 500）', async () => {
+      const r = res()
+      const badReq = {
+        method: 'POST',
+        url: `${P}/delete`,
+        headers: { 'x-dsh-plugin': 'session-delete' },
+        async *[Symbol.asyncIterator]() {
+          yield Buffer.from('not-json{')
+        },
+      }
+      await routes.get(`${P}/delete`)(badReq, r)
+      assert.equal(r.status, 400)
+      assert.equal(r.body.error.code, 'INVALID_BODY')
+    })
+
     await rm(home, { recursive: true, force: true })
     done()
   })()

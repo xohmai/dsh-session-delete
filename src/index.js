@@ -41,6 +41,8 @@ const PLUGIN_HEADER = 'x-dsh-plugin'
 const ID_RE = /^session-[A-Za-z0-9-]{8,80}$/
 /** 回收站条目名白名单（时间戳-id，无路径分隔符）。 */
 const ENTRY_RE = /^[A-Za-z0-9._-]{1,120}$/
+/** 回收站根内的保留文件名（审计日志），不可作为条目操作。 */
+const AUDIT_LOG = 'audit.log'
 
 // ---------------------------------------------------------------------------
 // 小工具
@@ -123,7 +125,7 @@ export function apply(ctx) {
     try {
       const root = await trashRoot()
       await mkdir(root, { recursive: true })
-      await appendFile(join(root, 'audit.log'), line + '\n')
+      await appendFile(join(root, AUDIT_LOG), line + '\n')
     } catch {
       /* 审计失败不阻断主流程 */
     }
@@ -343,10 +345,30 @@ export function apply(ctx) {
     return items
   }
 
+  /**
+   * 校验并解析回收站条目路径（restore/purge 共用的唯一入口）。
+   * 除 ENTRY_RE 外还显式拒绝 `.`/`..`（该正则允许它们，join 后会逃出回收站）
+   * 和保留名 audit.log，并要求目标真实存在且是目录——防止把审计日志当条目删除。
+   */
+  async function resolveTrashEntryDir(entry) {
+    if (
+      typeof entry !== 'string' ||
+      !ENTRY_RE.test(entry) ||
+      entry === '.' ||
+      entry === '..' ||
+      entry === AUDIT_LOG
+    ) {
+      throw httpError(400, 'INVALID_ENTRY', '回收站条目名非法')
+    }
+    const dir = join(await trashRoot(), entry)
+    const st = await stat(dir).catch(() => undefined)
+    if (st === undefined) throw httpError(404, 'NOT_FOUND', '回收站条目不存在')
+    if (!st.isDirectory()) throw httpError(400, 'NOT_ENTRY', '回收站条目必须是目录')
+    return dir
+  }
+
   async function restoreSession(entry) {
-    if (typeof entry !== 'string' || !ENTRY_RE.test(entry)) throw httpError(400, 'INVALID_ENTRY', '回收站条目名非法')
-    const root = await trashRoot()
-    const entryDir = join(root, entry)
+    const entryDir = await resolveTrashEntryDir(entry)
     const dataDir = join(entryDir, 'data')
     if ((await stat(dataDir).catch(() => undefined)) === undefined) {
       throw httpError(404, 'NOT_FOUND', '回收站条目不存在')
@@ -357,7 +379,11 @@ export function apply(ctx) {
     } catch {
       throw httpError(500, 'NO_META', '回收站条目缺少 meta.json，无法还原')
     }
-    const location = ctx.sessionPersistence.locate({ id: meta.id, cwd: meta.cwd ?? undefined })
+    // meta.json 是磁盘文件，可能被篡改；id 过白名单后再交给 locate（纵深防御）
+    if (typeof meta?.id !== 'string' || !ID_RE.test(meta.id)) {
+      throw httpError(500, 'BAD_META', '回收站条目 meta.json 中的会话 id 非法')
+    }
+    const location = ctx.sessionPersistence.locate({ id: meta.id, cwd: typeof meta.cwd === 'string' ? meta.cwd : undefined })
     if (!location || typeof location.path !== 'string') {
       throw httpError(500, 'UNSUPPORTED', '当前持久化后端无法定位还原目标')
     }
@@ -382,11 +408,7 @@ export function apply(ctx) {
       await audit('purge-all', { count: items.length })
       return { ok: true, count: items.length }
     }
-    if (typeof entry !== 'string' || !ENTRY_RE.test(entry)) throw httpError(400, 'INVALID_ENTRY', '回收站条目名非法')
-    const entryDir = join(root, entry)
-    if ((await stat(entryDir).catch(() => undefined)) === undefined) {
-      throw httpError(404, 'NOT_FOUND', '回收站条目不存在')
-    }
+    const entryDir = await resolveTrashEntryDir(entry)
     await rm(entryDir, { recursive: true, force: true })
     await audit('purge', { entry })
     return { ok: true, count: 1 }
@@ -409,7 +431,12 @@ export function apply(ctx) {
     for await (const chunk of req) chunks.push(chunk)
     const text = Buffer.concat(chunks).toString('utf8')
     if (!text.trim()) return {}
-    const data = JSON.parse(text)
+    let data
+    try {
+      data = JSON.parse(text)
+    } catch {
+      throw httpError(400, 'INVALID_BODY', '请求体不是合法 JSON')
+    }
     if (typeof data !== 'object' || data === null || Array.isArray(data)) {
       throw httpError(400, 'INVALID_BODY', '请求体必须是 JSON 对象')
     }
