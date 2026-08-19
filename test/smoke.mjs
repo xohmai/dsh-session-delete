@@ -193,6 +193,7 @@ const P = '/api/session-delete'
       assert.equal(meta.id, id)
       assert.equal(meta.cwd, cwdA)
       assert.equal(meta.sizeBytes, 500)
+      assert.equal(meta.title, '会话 aaaa', '标题应随会话进回收站（缓存命中路径）')
       assert.ok(await stat(join(entryDir, 'data', 'session.jsonl.zstd')).then(() => true, () => false), '日志文件应进入回收站')
       assert.ok(!(await stat(dirBefore).then(() => true, () => false)), '原目录应消失')
       const audit = await readFile(join(home, 'trash', 'sessions', 'audit.log'), 'utf8')
@@ -213,6 +214,7 @@ const P = '/api/session-delete'
       assert.equal(r.status, 200)
       assert.equal(r.body.items.length, 1)
       assert.equal(r.body.items[0].id, 'session-aaaa1111-0000-4000-8000-000000000001')
+      assert.equal(r.body.items[0].title, '会话 aaaa', '回收站应回传会话名称')
       assert.equal(r.body.items[0].sizeBytes, 500)
     })
 
@@ -287,6 +289,33 @@ const P = '/api/session-delete'
       assert.equal(r.body.count, 1)
       const left = await readdir(join(home, 'trash', 'sessions')).then((xs) => xs.filter((x) => x !== 'audit.log'))
       assert.equal(left.length, 0)
+    })
+
+    await test('无缓存删除也能取标题（titlesFor 直读路径）', async () => {
+      // cccc 从未经过 /list、/preview——recordCache 无记录，删除时走 titlesFor
+      await createSession('session-eeee7777-0000-4000-8000-000000000007', cwdA, 120)
+      const rDel = res()
+      await routes.get(`${P}/delete`)(bodyReq('POST', `${P}/delete`, { id: 'session-eeee7777-0000-4000-8000-000000000007' }), rDel)
+      assert.equal(rDel.status, 200, JSON.stringify(rDel.body))
+      headers.splice(headers.findIndex((x) => x.id === 'session-eeee7777-0000-4000-8000-000000000007'), 1)
+      const r = res()
+      await routes.get(`${P}/trash`)(get(`${P}/trash`), r)
+      assert.equal(r.body.items[0].title, '会话 eeee', '无缓存路径也应取到标题')
+      // 收尾：彻底删除该条目，不污染后续用例
+      await routes.get(`${P}/purge`)(bodyReq('POST', `${P}/purge`, { entry: r.body.items[0].entry }), res())
+    })
+
+    await test('旧版回收站条目缺 title → 回退 id 显示（title 为 null）', async () => {
+      const entryDir = join(home, 'trash', 'sessions', '20200101-000000-session-ffff8888-0000-4000-8000-000000000008')
+      await mkdir(join(entryDir, 'data'), { recursive: true })
+      await writeFile(join(entryDir, 'data', 'session.jsonl.zstd'), 'x'.repeat(32))
+      await writeFile(join(entryDir, 'meta.json'), JSON.stringify({ id: 'session-ffff8888-0000-4000-8000-000000000008', cwd: cwdA, trashedAt: '2020-01-01T00:00:00Z', sizeBytes: 32 }))
+      const r = res()
+      await routes.get(`${P}/trash`)(get(`${P}/trash`), r)
+      const it = r.body.items.find((x) => x.id.endsWith('0008'))
+      assert.ok(it, '手动条目应出现在回收站清单')
+      assert.equal(it.title, null, '缺 title 的旧条目应为 null（客户端回退显示 id）')
+      await routes.get(`${P}/purge`)(bodyReq('POST', `${P}/purge`, { entry: it.entry }), res())
     })
 
     await test('缺自定义头的 POST → 403（CSRF 防线）', async () => {

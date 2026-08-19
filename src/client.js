@@ -7,7 +7,7 @@
  *     · 归档会话（默认页签）—— 已归档会话清单：在线还原（解除归档，侧栏
  *       原分组立即可见）+ 单条删除（两步确认）+ 多选批量
  *     · 全部会话 —— 按工作区分组的全量清单，搜索/过滤/批量删除
- *     · 回收站 —— 还原 / 彻底删除 / 清空
+ *     · 回收站 —— 按名称识别被删会话，多选批量还原 / 彻底删除 / 一键清空
  *
  * 数据全部来自本机 Host API（/api/session-delete/*）；删除当前打开的会话后
  * 经 workspaces.startSession() 切到同工作区空白会话，UI 不悬空。
@@ -36,15 +36,21 @@ window.__ModuleLoader__.load({
       .sd-spin { display: inline-block; animation: sdSpin .8s linear infinite }
       /* 列表行：行间真实间距让相邻的选中背景彼此分开；选中/悬停样式统一在类里，
        * 避免 inline style 压掉 :hover（选中行悬停加深的反馈不能丢）。 */
-      .sd-row { border-radius: 6px; margin-bottom: 3px }
-      .sd-row:hover { background: color-mix(in srgb, var(--dsw-alias-label-secondary) 7%, transparent) }
+      .sd-row { border-radius: 6px; margin-bottom: 3px; transition: background .14s ease, box-shadow .14s ease }
+      .sd-row:hover { background: color-mix(in srgb, var(--dsw-alias-label-secondary) 6%, transparent) }
+      /* 选中态三件套：品牌色底 + 3px 左侧强调条 + 1px 内描边——描边让选中行
+       * 在密集列表里「浮」出来，与仅变灰的悬停态拉开层级；切换有 0.14s 过渡。 */
       .sd-row.sd-sel {
-        background: color-mix(in srgb, var(--dsw-alias-brand-primary) 7%, transparent);
-        box-shadow: inset 3px 0 0 var(--dsw-alias-brand-primary);
+        background: color-mix(in srgb, var(--dsw-alias-brand-primary) 10%, transparent);
+        box-shadow:
+          inset 3px 0 0 var(--dsw-alias-brand-primary),
+          inset 0 0 0 1px color-mix(in srgb, var(--dsw-alias-brand-primary) 28%, transparent);
       }
       .sd-row.sd-sel:hover {
-        background: color-mix(in srgb, var(--dsw-alias-brand-primary) 12%, transparent);
+        background: color-mix(in srgb, var(--dsw-alias-brand-primary) 14%, transparent);
       }
+      /* 行内复选框统一尺寸，选中视觉与行态同步（accentColor 跟随品牌色） */
+      .sd-row > input[type='checkbox'] { width: 14px; height: 14px; flex: none }
       /* 工作区分组头：标签化（小一号/加粗/次要色），吸顶 + 底部分隔线——
        * 长列表滚动时分组归属始终可见；与 13px/常规/主色的会话行形成清晰层级。 */
       .sd-grouphd {
@@ -90,7 +96,7 @@ window.__ModuleLoader__.load({
       }
       @media (prefers-reduced-motion: reduce) {
         .sd-fade, .sd-spin { animation: none !important }
-        .sd-btn { transition: none !important }
+        .sd-btn, .sd-row { transition: none !important }
       }
     `
 
@@ -556,6 +562,79 @@ window.__ModuleLoader__.load({
           await loadTrash()
         }
       }
+      /** 批量还原回收站条目：文件归位 + 自动解除归档，逐条容错。 */
+      async function fireBatchRestore(entries) {
+        setArm(null)
+        setBusy(true)
+        setProgress({ done: 0, total: entries.length, label: '还原中' })
+        let ok = 0
+        let failed = 0
+        let message = null
+        try {
+          for (let i = 0; i < entries.length; i += 1) {
+            try {
+              await post(`${PREFIX}/restore`, { entry: entries[i] })
+              ok += 1
+            } catch (e) {
+              failed += 1
+              if (message === null) message = String(e?.message ?? e)
+            }
+            setProgress({ done: i + 1, total: entries.length, label: '还原中' })
+          }
+          if (failed === 0) {
+            setNotice({
+              kind: 'ok',
+              title: `已还原 ${ok} 项`,
+              detail: unarchiveSupported ? '已解除归档 · 侧栏原分组立即可见' : '文件已归位；解除归档见「归档会话」页签',
+              at: at(),
+            })
+          } else if (ok > 0) {
+            setNotice({ kind: 'warn', title: `已还原 ${ok} 项 · ${failed} 项失败`, detail: `首条失败：${message}`, at: at() })
+          } else {
+            setNotice({ kind: 'err', title: `全部还原失败（${failed} 项）`, detail: message, at: at() })
+          }
+        } finally {
+          setBusy(false)
+          setProgress(null)
+          setSelected(new Set())
+          await loadTrash()
+          loadList()
+        }
+      }
+      /** 批量彻底删除所选条目（两步确认后进入）。 */
+      async function fireBatchPurgeSelected() {
+        const entries = [...selected]
+        setArm(null)
+        setBusy(true)
+        setProgress({ done: 0, total: entries.length, label: '彻底删除中' })
+        let ok = 0
+        let failed = 0
+        let message = null
+        try {
+          for (let i = 0; i < entries.length; i += 1) {
+            try {
+              await post(`${PREFIX}/purge`, { entry: entries[i] })
+              ok += 1
+            } catch (e) {
+              failed += 1
+              if (message === null) message = String(e?.message ?? e)
+            }
+            setProgress({ done: i + 1, total: entries.length, label: '彻底删除中' })
+          }
+          if (failed === 0) {
+            setNotice({ kind: 'ok', title: `已彻底删除 ${ok} 项`, detail: '回收站中已不可恢复', at: at() })
+          } else if (ok > 0) {
+            setNotice({ kind: 'warn', title: `已彻底删除 ${ok} 项 · ${failed} 项失败`, detail: `首条失败：${message}`, at: at() })
+          } else {
+            setNotice({ kind: 'err', title: `全部彻底删除失败（${failed} 项）`, detail: message, at: at() })
+          }
+        } finally {
+          setBusy(false)
+          setProgress(null)
+          setSelected(new Set())
+          await loadTrash()
+        }
+      }
 
       // ---------- 数据视图 ----------
       const sessions = list ?? []
@@ -571,6 +650,8 @@ window.__ModuleLoader__.load({
       })
 
       const toggle = (id) => {
+        // 批量彻底删除处于武装态时改选集会让按钮计数失真——直接解除武装
+        if (arm === 'trash-sel') setArm(null)
         setSelected((prev) => {
           const next = new Set(prev)
           if (next.has(id)) next.delete(id)
@@ -704,29 +785,53 @@ window.__ModuleLoader__.load({
         )
       }
 
-      const trashRow = (it) =>
-        h(
+      /** 回收站行：与会话行同款多选交互（整行点击选中，按钮阻止冒泡）。
+       * 主文本优先显示会话名（删除时随 meta.json 带入），旧条目无标题回退 id。 */
+      const trashRow = (it) => {
+        const isSel = selected.has(it.entry)
+        return h(
           'div',
-          { key: it.entry, className: 'sd-row', style: { display: 'flex', alignItems: 'center', gap: 8, padding: '5px 6px 5px 10px', minHeight: 32 } },
+          {
+            key: it.entry,
+            className: isSel ? 'sd-row sd-sel' : 'sd-row',
+            style: { display: 'flex', alignItems: 'center', gap: 8, padding: '5px 6px 5px 10px', minHeight: 32, cursor: 'pointer' },
+            onClick: () => toggle(it.entry),
+          },
           [
+            h('input', {
+              key: 'c',
+              type: 'checkbox',
+              checked: isSel,
+              onChange: () => toggle(it.entry),
+              onClick: (e) => e.stopPropagation(),
+              style: { accentColor: T.brand, flexShrink: 0, cursor: 'pointer' },
+            }),
             h(
               'span',
-              { key: 't', style: { fontSize: 13, color: T.label, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, minWidth: 0 }, title: `${it.id}\n${it.cwd ?? ''}` },
-              it.id,
+              { key: 't', style: { fontSize: 13, color: T.label, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, minWidth: 0 }, title: `${it.title ?? ''}\n${it.id}\n${it.cwd ?? ''}` },
+              it.title || it.id,
             ),
             h('span', { key: 'm', title: it.trashedAt ?? '', style: { fontSize: 11, color: T.secondary, flexShrink: 0, width: 64, textAlign: 'right' } }, fmtAgo(it.trashedAt ? Date.parse(it.trashedAt) : 0)),
             h('span', { key: 's', style: { fontSize: 11, color: T.secondary, flexShrink: 0, width: 64, textAlign: 'right', fontVariantNumeric: 'tabular-nums' } }, fmtSize(it.sizeBytes)),
-            h('button', { key: 'r', className: 'sd-btn', style: smallBtn, disabled: busy, onClick: () => fireRestore(it.entry) }, '还原'),
-            h(ArmDeleteButton, {
-              key: 'p',
-              armed: arm === `t:${it.entry}`,
-              onArm: () => setArm(`t:${it.entry}`),
-              onFire: () => firePurge(it.entry),
-              busy,
-              label: '彻底删除',
-            }),
+            h(
+              'span',
+              { key: 'rw', onClick: (e) => e.stopPropagation(), style: { display: 'inline-flex', flexShrink: 0 } },
+              h('button', { className: 'sd-btn', style: { ...smallBtn, borderColor: `color-mix(in srgb, ${T.brand} 45%, ${T.border})`, color: T.brand }, disabled: busy, onClick: () => fireRestore(it.entry) }, '还原'),
+            ),
+            h(
+              'span',
+              { key: 'pw', onClick: (e) => e.stopPropagation(), style: { display: 'inline-flex', flexShrink: 0 } },
+              h(ArmDeleteButton, {
+                armed: arm === `t:${it.entry}`,
+                onArm: () => setArm(`t:${it.entry}`),
+                onFire: () => firePurge(it.entry),
+                busy,
+                label: '彻底删除',
+              }),
+            ),
           ],
         )
+      }
 
       // ---------- 页签内容（仅滚动列表区） ----------
       function ArchivedTab() {
@@ -794,20 +899,66 @@ window.__ModuleLoader__.load({
         if (tab === 'trash') {
           const items = trash ?? []
           if (items.length === 0) return null
-          return h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, borderTop: `1px solid ${T.border}`, paddingTop: 8, marginTop: 8, flex: 'none' } }, [
-            h('span', { key: 'n', style: { fontSize: 12, color: T.secondary } }, `${items.length} 项 · ${fmtSize(items.reduce((a, i) => a + (i.sizeBytes ?? 0), 0))}`),
-            h(
-              'button',
-              {
-                key: 'p',
-                className: 'sd-btn',
-                style: { ...smallBtn, marginLeft: 'auto', background: purgeAllArmed ? T.err : 'transparent', borderColor: purgeAllArmed ? T.err : T.border, color: purgeAllArmed ? '#fff' : T.err, fontWeight: 600 },
-                disabled: busy,
-                onClick: () => (purgeAllArmed ? firePurgeAll() : setPurgeAllArmed(true)),
-              },
-              purgeAllArmed ? '确认清空（不可恢复）' : '清空回收站',
-            ),
-          ])
+          const selItems = items.filter((i) => selected.has(i.entry))
+          const allSelected = items.every((i) => selected.has(i.entry))
+          const purgeSelArmed = arm === 'trash-sel'
+          return h(
+            'div',
+            { style: { borderTop: `1px solid ${T.border}`, paddingTop: 8, marginTop: 8, flex: 'none' } },
+            h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' } }, [
+              h(
+                'span',
+                { key: 'n', style: { fontSize: 12, color: T.secondary } },
+                busy
+                  ? `${progress?.label ?? '处理中'} ${progress?.done ?? 0}/${progress?.total ?? 0}`
+                  : selected.size > 0
+                    ? `已选 ${selected.size} 项 · ${fmtSize(selItems.reduce((a, i) => a + (i.sizeBytes ?? 0), 0))}`
+                    : `${items.length} 项 · ${fmtSize(items.reduce((a, i) => a + (i.sizeBytes ?? 0), 0))}`,
+              ),
+              h(
+                'button',
+                { key: 'all', className: 'sd-btn', style: smallBtn, disabled: busy || trashLoading, onClick: () => setSelected(allSelected ? new Set() : new Set(items.map((i) => i.entry))) },
+                allSelected ? '取消全选' : `全选 (${items.length})`,
+              ),
+              selected.size > 0
+                ? h('button', { key: 'c', className: 'sd-btn', style: smallBtn, disabled: busy, onClick: () => setSelected(new Set()) }, '清除')
+                : null,
+              h(
+                'button',
+                {
+                  key: 'r',
+                  className: 'sd-btn',
+                  style: { ...smallBtn, borderColor: `color-mix(in srgb, ${T.brand} 45%, ${T.border})`, color: T.brand, fontWeight: 600 },
+                  disabled: busy || selected.size === 0,
+                  title: '还原所选：文件归位并解除归档',
+                  onClick: () => fireBatchRestore([...selected]),
+                },
+                `还原所选 (${selected.size})`,
+              ),
+              h(
+                'button',
+                {
+                  key: 'ps',
+                  className: 'sd-btn',
+                  style: { ...smallBtn, marginLeft: 'auto', background: purgeSelArmed ? T.err : 'transparent', borderColor: purgeSelArmed ? T.err : T.border, color: purgeSelArmed ? '#fff' : T.err, fontWeight: 600 },
+                  disabled: busy || selected.size === 0,
+                  onClick: () => (purgeSelArmed ? fireBatchPurgeSelected() : setArm('trash-sel')),
+                },
+                purgeSelArmed ? `确认彻底删除 (${selected.size})` : `彻底删除所选 (${selected.size})`,
+              ),
+              h(
+                'button',
+                {
+                  key: 'p',
+                  className: 'sd-btn',
+                  style: { ...smallBtn, background: purgeAllArmed ? T.err : 'transparent', borderColor: purgeAllArmed ? T.err : T.border, color: purgeAllArmed ? '#fff' : T.err, fontWeight: 600 },
+                  disabled: busy,
+                  onClick: () => (purgeAllArmed ? firePurgeAll() : setPurgeAllArmed(true)),
+                },
+                purgeAllArmed ? '确认清空（不可恢复）' : '清空回收站',
+              ),
+            ]),
+          )
         }
         const rows = tab === 'archived' ? archivedSessions : filteredAll
         if (rows.length === 0) return null

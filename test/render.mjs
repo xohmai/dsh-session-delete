@@ -117,13 +117,21 @@ await test('全部会话页签有数据：分组头 + 行 + 搜索/过滤工具�
   assert.ok(html.includes('2 / 2'), '命中计数')
 })
 
-await test('回收站页签有数据：条目 + 还原/彻底删除 + 底部清空栏', () => {
-  const trash = [{ entry: '20260801-000000-session-test-0001', id: 'session-test-0001', cwd: '/tmp', trashedAt: new Date().toISOString(), sizeBytes: 4096 }]
+await test('回收站页签有数据：名称 + 多选 + 批量按钮 + 底部清空栏', () => {
+  const trash = [
+    { entry: '20260801-000000-session-test-0001', id: 'session-test-0001', title: '被删的会话', cwd: '/tmp', trashedAt: new Date().toISOString(), sizeBytes: 4096 },
+    { entry: '20260801-000100-session-test-0002', id: 'session-test-0002', title: null, cwd: '/tmp', trashedAt: new Date().toISOString(), sizeBytes: 1024 },
+  ]
   const html = renderToString(h(SettingsPage, { close: () => {}, currentId: 'x', initialTab: 'trash', initialTrash: trash }))
-  assert.ok(html.includes('session-test-0001'), '条目 id')
-  assert.ok(html.includes('还原'), '还原按钮')
-  assert.ok(html.includes('彻底删除'), '彻底删除按钮')
+  assert.ok(html.includes('被删的会话'), '有标题的条目应显示会话名')
+  assert.ok(html.includes('session-test-0002'), '无标题条目回退显示 id')
+  assert.ok(html.includes('还原'), '单条还原按钮')
+  assert.ok(html.includes('彻底删除'), '单条彻底删除按钮')
+  assert.ok(html.includes('还原所选'), '批量还原按钮')
+  assert.ok(html.includes('彻底删除所选'), '批量彻底删除按钮')
+  assert.ok(html.includes('全选'), '全选按钮')
   assert.ok(html.includes('清空回收站'), '底部清空栏')
+  assert.ok(html.includes('type="checkbox"'), '回收站行应有复选框（多选）')
 })
 
 if (failed.length) {

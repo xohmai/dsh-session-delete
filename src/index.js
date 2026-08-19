@@ -326,6 +326,15 @@ export function apply(ctx) {
       return { id, ok: true, note: 'dir-missing' }
     }
     const sizeBytes = await dirSize(dir)
+    // 标题随会话进回收站：缓存优先（清理面板刚读过清单），缺失时单独折叠一次。
+    // 回收站据此显示会话名而非一串 session-id；旧条目无 title 时客户端回退显示 id。
+    let title = null
+    const cachedRec = recordCache.get(id)
+    if (typeof cachedRec?.title === 'string') title = cachedRec.title
+    else {
+      const titles = await titlesFor([id])
+      if (typeof titles.get(id) === 'string') title = titles.get(id)
+    }
 
     const root = await trashRoot()
     const entry = `${entryStamp()}-${id}`
@@ -343,6 +352,7 @@ export function apply(ctx) {
       JSON.stringify(
         {
           id,
+          title,
           cwd: header.cwd ?? null,
           trashedAt: new Date().toISOString(),
           sizeBytes,
@@ -379,6 +389,7 @@ export function apply(ctx) {
       items.push({
         entry: entry.name,
         id: typeof meta?.id === 'string' ? meta.id : entry.name.replace(/^\d+-/, ''),
+        title: typeof meta?.title === 'string' && meta.title ? meta.title : null,
         cwd: typeof meta?.cwd === 'string' ? meta.cwd : null,
         trashedAt: typeof meta?.trashedAt === 'string' ? meta.trashedAt : null,
         sizeBytes: await dirSize(join(entryDir, 'data')),
