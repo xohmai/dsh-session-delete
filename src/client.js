@@ -49,8 +49,10 @@ window.__ModuleLoader__.load({
       .sd-row.sd-sel:hover {
         background: color-mix(in srgb, var(--dsw-alias-brand-primary) 14%, transparent);
       }
-      /* 行内复选框统一尺寸，选中视觉与行态同步（accentColor 跟随品牌色） */
-      .sd-row > input[type='checkbox'] { width: 14px; height: 14px; flex: none }
+      /* 复选框统一 14px：会话行/分组头/回收站行三处共用 .sd-check 类——
+       * 尺寸规则挂在类上而非位置派生选择器上，分组头（非 .sd-row）不会漏；
+       * 默认 13px 与显式 14px 混用正是「分组的选择框看起来更小」的原因。 */
+      .sd-check { width: 14px; height: 14px; flex: none }
       /* 工作区分组头：标签化（小一号/加粗/次要色），吸顶 + 底部分隔线——
        * 长列表滚动时分组归属始终可见；与 13px/常规/主色的会话行形成清晰层级。 */
       .sd-grouphd {
@@ -741,10 +743,11 @@ window.__ModuleLoader__.load({
             h('input', {
               key: 'c',
               type: 'checkbox',
+              className: 'sd-check',
               checked: selected.has(s.id),
               onChange: () => toggle(s.id),
               onClick: (e) => e.stopPropagation(),
-              style: { accentColor: T.brand, flexShrink: 0, cursor: 'pointer' },
+              style: { accentColor: T.brand, cursor: 'pointer' },
             }),
             h(
               'span',
@@ -801,10 +804,11 @@ window.__ModuleLoader__.load({
             h('input', {
               key: 'c',
               type: 'checkbox',
+              className: 'sd-check',
               checked: isSel,
               onChange: () => toggle(it.entry),
               onClick: (e) => e.stopPropagation(),
-              style: { accentColor: T.brand, flexShrink: 0, cursor: 'pointer' },
+              style: { accentColor: T.brand, cursor: 'pointer' },
             }),
             h(
               'span',
@@ -867,10 +871,11 @@ window.__ModuleLoader__.load({
                       h('input', {
                         key: 'c',
                         type: 'checkbox',
+                        className: 'sd-check',
                         checked: groupSessions.every((s) => selected.has(s.id)),
                         onChange: () => toggleGroup(groupSessions),
                         onClick: (e) => e.stopPropagation(),
-                        style: { accentColor: T.brand, cursor: 'pointer', flexShrink: 0 },
+                        style: { accentColor: T.brand, cursor: 'pointer' },
                       }),
                       h('span', { key: 'n', style: { fontSize: 12, fontWeight: 600, color: T.secondary, letterSpacing: 0.3, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, title: meta.path }, meta.name),
                       h('span', { key: 'i', style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary, var(--dsw-alias-label-secondary))', flexShrink: 0 } }, `${groupSessions.length} 会话 · ${fmtSize(groupSessions.reduce((a, s) => a + (s.sizeBytes ?? 0), 0))}`),

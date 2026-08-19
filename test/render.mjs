@@ -115,6 +115,9 @@ await test('全部会话页签有数据：分组头 + 行 + 搜索/过滤工具�
   assert.ok(html.includes('子代理'), '子代理标记')
   assert.ok(html.includes('未归档'), '过滤按钮')
   assert.ok(html.includes('2 / 2'), '命中计数')
+  // 复选框统一尺寸回归：2 会话行 + 2 分组头，每个都必须挂 .sd-check
+  // （旧 bug：尺寸选择器只覆盖 .sd-row，分组头按默认 13px 渲染显得更小）
+  assert.equal((html.match(/sd-check/g) ?? []).length, 4, '会话行与分组头的复选框都应挂 sd-check 类')
 })
 
 await test('回收站页签有数据：名称 + 多选 + 批量按钮 + 底部清空栏', () => {
