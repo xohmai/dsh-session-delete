@@ -347,9 +347,10 @@ window.__ModuleLoader__.load({
         setNotice(null)
         setArm(null)
         setSelected(new Set())
-        if (tab === 'trash') {
-          if (trash === null) loadTrash()
-        } else if (list === null) loadList()
+        // 页签切入总是重拉：/trash 毫秒级、/list 有宿主 mtime 缓存，均为无感刷新；
+        // 若只在 null 时加载，删除/还原后切回页签会展示陈旧列表。
+        if (tab === 'trash') loadTrash()
+        else loadList()
       }, [tab])
 
       // 4 秒未确认自动解除武装
@@ -363,11 +364,14 @@ window.__ModuleLoader__.load({
       }, [arm, purgeAllArmed])
 
       // ---------- 动作 ----------
-      /** 删除成功后本地移除对应行（免整表重拉；手动 ↻ 或切页签会重新加载）。 */
+      /** 删除成功后本地移除对应行，并同步回收站状态（页签徽标即时反映新删条目）。 */
       function removeDeletedLocally(okIds) {
-        if (list === null || okIds.length === 0) return
-        const gone = new Set(okIds)
-        setList(list.filter((s) => !gone.has(s.id)))
+        if (okIds.length === 0) return
+        if (list !== null) {
+          const gone = new Set(okIds)
+          setList(list.filter((s) => !gone.has(s.id)))
+        }
+        loadTrash() // 1ms 级接口；trash 从 null→有值 后「回收站 (N)」徽标立即出现/更新
       }
       /** 成功删除的会话体积合计（按删除前清单精确计算）。 */
       const sizeById = new Map((list ?? []).map((s) => [s.id, s.sizeBytes ?? 0]))
