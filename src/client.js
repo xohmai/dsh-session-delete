@@ -4,7 +4,8 @@
  * 手写 __ModuleLoader__ 包壳（与 tsdown 产物同构），零构建步骤。
  * 槽位：
  *   settings.section  设置页「归档会话」管理页（唯一入口）：
- *     · 归档会话（默认页签）—— 已归档会话清单，单条删除（两步确认）+ 多选批量
+ *     · 归档会话（默认页签）—— 已归档会话清单：在线还原（解除归档，侧栏
+ *       原分组立即可见）+ 单条删除（两步确认）+ 多选批量
  *     · 全部会话 —— 按工作区分组的全量清单，搜索/过滤/批量删除
  *     · 回收站 —— 还原 / 彻底删除 / 清空
  *
@@ -306,6 +307,9 @@ window.__ModuleLoader__.load({
       const [listError, setListError] = useState(null)
       const [trashLoading, setTrashLoading] = useState(false)
       const [trashError, setTrashError] = useState(null)
+      // 宿主 /list 上报的在线解除归档能力（registry 内部状态机可用性）；
+      // 旧版 DSH 为 false：隐藏还原入口，保留离线 unhide 指引
+      const [unarchiveSupported, setUnarchiveSupported] = useState(props?.initialUnarchiveSupported ?? true)
       const [query, setQuery] = useState('')
       const [filter, setFilter] = useState('active') // active | archived | stale30 | all（仅 all 页签）
       const [selected, setSelected] = useState(new Set())
@@ -329,6 +333,7 @@ window.__ModuleLoader__.load({
           const data = await api(`${PREFIX}/list`)
           setList(data.sessions ?? [])
           setWorkspaces(data.workspaces ?? [])
+          setUnarchiveSupported(data.unarchiveSupported === true)
         } catch (e) {
           setListError(String(e?.message ?? e))
         } finally {
@@ -381,6 +386,12 @@ window.__ModuleLoader__.load({
           setList(list.filter((s) => !gone.has(s.id)))
         }
         loadTrash() // 1ms 级接口；trash 从 null→有值 后「回收站 (N)」徽标立即出现/更新
+      }
+      /** 在线解除归档成功后本地把对应行标记为未归档：离开归档页签、徽标即时递减。 */
+      function markUnarchivedLocally(okIds) {
+        if (okIds.length === 0 || list === null) return
+        const done = new Set(okIds)
+        setList(list.map((s) => (done.has(s.id) ? { ...s, archived: false } : s)))
       }
       /** 成功删除的会话体积合计（按删除前清单精确计算）。 */
       const sizeById = new Map((list ?? []).map((s) => [s.id, s.sizeBytes ?? 0]))
@@ -438,6 +449,64 @@ window.__ModuleLoader__.load({
           setSelected(new Set())
         }
       }
+      async function fireSingleUnarchive(id) {
+        setBusy(true)
+        const title = (list ?? []).find((s) => s.id === id)?.title
+        try {
+          await post(`${PREFIX}/unarchive`, { id })
+          markUnarchivedLocally([id])
+          setNotice({
+            kind: 'ok',
+            title: `已还原「${title || shortId(id)}」`,
+            detail: '已解除归档 · 侧栏原分组立即可见',
+            at: at(),
+          })
+        } catch (e) {
+          const code = e?.data?.error?.code
+          setNotice({
+            kind: code === 'UNSUPPORTED' ? 'warn' : 'err',
+            title: '还原失败',
+            detail: String(e?.message ?? e),
+            at: at(),
+          })
+        } finally {
+          setBusy(false)
+        }
+      }
+      async function fireBatchUnarchive(ids) {
+        setBusy(true)
+        setProgress({ done: 0, total: ids.length, label: '还原中' })
+        let ok = 0
+        let failed = 0
+        let message = null
+        const okIds = []
+        try {
+          for (let i = 0; i < ids.length; i += 1) {
+            const id = ids[i]
+            try {
+              await post(`${PREFIX}/unarchive`, { id })
+              ok += 1
+              okIds.push(id)
+            } catch (e) {
+              failed += 1
+              if (message === null) message = `${shortId(id)}：${e?.message ?? e}`
+            }
+            setProgress({ done: i + 1, total: ids.length, label: '还原中' })
+          }
+          markUnarchivedLocally(okIds)
+          if (failed === 0) {
+            setNotice({ kind: 'ok', title: `已还原 ${ok} 个会话`, detail: '已解除归档 · 侧栏原分组立即可见', at: at() })
+          } else if (ok > 0) {
+            setNotice({ kind: 'warn', title: `已还原 ${ok} 个 · ${failed} 个失败`, detail: `首条失败：${message}`, at: at() })
+          } else {
+            setNotice({ kind: 'err', title: `全部还原失败（${failed} 个）`, detail: message, at: at() })
+          }
+        } finally {
+          setBusy(false)
+          setProgress(null)
+          setSelected(new Set())
+        }
+      }
       async function fireRestore(entry) {
         setArm(null)
         setBusy(true)
@@ -447,17 +516,18 @@ window.__ModuleLoader__.load({
             setNotice({
               kind: 'warn',
               title: `文件已还原（${shortId(r.id ?? '')}）`,
-              detail: '该会话仍在归档集中，侧栏默认不显示；彻底找回见 README 的 unhide 步骤',
+              detail: '当前 DSH 版本无法在线解除归档；彻底找回见 README 的 unhide 步骤',
               at: at(),
             })
           } else {
-            setNotice({ kind: 'ok', title: '已还原', detail: null, at: at() })
+            setNotice({ kind: 'ok', title: `已还原（${shortId(r.id ?? '')}）`, detail: '已解除归档 · 侧栏原分组立即可见', at: at() })
           }
         } catch (e) {
           setNotice({ kind: 'err', title: '还原失败', detail: String(e?.message ?? e), at: at() })
         } finally {
           setBusy(false)
           await loadTrash()
+          loadList() // 还原的会话回到清单（归档页签/全部页签与徽标同步）
         }
       }
       async function firePurge(entry) {
@@ -605,6 +675,19 @@ window.__ModuleLoader__.load({
             s.origin === 'subagent' ? h('span', { key: 'sa', style: tagStyle(T.warn) }, '子代理') : null,
             h('span', { key: 'm', title: fmtDate(s.mtimeMs), style: { fontSize: 11, color: T.secondary, flexShrink: 0, width: 64, textAlign: 'right' } }, fmtAgo(s.mtimeMs)),
             h('span', { key: 's', style: { fontSize: 11, color: T.secondary, flexShrink: 0, width: 64, textAlign: 'right', fontVariantNumeric: 'tabular-nums' } }, fmtSize(s.sizeBytes)),
+            opts?.restore
+              ? h(
+                  'span',
+                  { key: 'rw', onClick: (e) => e.stopPropagation(), style: { display: 'inline-flex', flexShrink: 0 } },
+                  h('button', {
+                    className: 'sd-btn',
+                    style: { ...smallBtn, borderColor: `color-mix(in srgb, ${T.brand} 45%, ${T.border})`, color: T.brand },
+                    disabled: busy,
+                    title: '解除归档：会话立即回到侧栏原分组',
+                    onClick: () => fireSingleUnarchive(s.id),
+                  }, '还原'),
+                )
+              : null,
             opts?.singleDelete
               ? h(
                   'span',
@@ -654,7 +737,7 @@ window.__ModuleLoader__.load({
             h('div', { key: 'b', style: { marginTop: 4 } }, '在侧栏会话上右键「归档会话」后，可在此处真正删除其磁盘记录。'),
           ])
         }
-        return h('div', null, archivedSessions.map((s) => sessionRow(s, { singleDelete: true })))
+        return h('div', null, archivedSessions.map((s) => sessionRow(s, { singleDelete: true, restore: unarchiveSupported })))
       }
 
       function AllTab() {
@@ -687,7 +770,7 @@ window.__ModuleLoader__.load({
                       h('span', { key: 'n', style: { fontSize: 12, fontWeight: 600, color: T.secondary, letterSpacing: 0.3, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, title: meta.path }, meta.name),
                       h('span', { key: 'i', style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary, var(--dsw-alias-label-secondary))', flexShrink: 0 } }, `${groupSessions.length} 会话 · ${fmtSize(groupSessions.reduce((a, s) => a + (s.sizeBytes ?? 0), 0))}`),
                     ]),
-                    ...groupSessions.map((s) => sessionRow(s, { indent: true, singleDelete: true })),
+                    ...groupSessions.map((s) => sessionRow(s, { indent: true, singleDelete: true, restore: s.archived && unarchiveSupported })),
                   ],
                 )
               }),
@@ -731,9 +814,10 @@ window.__ModuleLoader__.load({
         // 全选切换：作用于当前页签的可见行（归档页=全部归档；全部会话页=过滤+搜索后）
         const allSelected = rows.every((s) => selected.has(s.id))
         const toggleSelectAll = () => setSelected(allSelected ? new Set() : new Set(rows.map((s) => s.id)))
+        const showRestore = tab === 'archived' && unarchiveSupported
         return h('div', { style: { borderTop: `1px solid ${T.border}`, paddingTop: 8, marginTop: 8, flex: 'none' } }, [
           h('div', { key: 'b', style: { display: 'flex', alignItems: 'center', gap: 8 } }, [
-            h('span', { key: 'n', style: { fontSize: 12, color: T.secondary } }, busy ? `删除中 ${progress?.done ?? 0}/${progress?.total ?? 0}` : `已选 ${selected.size} 项 · ${fmtSize(selectedBytes(rows))}`),
+            h('span', { key: 'n', style: { fontSize: 12, color: T.secondary } }, busy ? `${progress?.label ?? '删除中'} ${progress?.done ?? 0}/${progress?.total ?? 0}` : `已选 ${selected.size} 项 · ${fmtSize(selectedBytes(rows))}`),
             h(
               'button',
               { key: 'all', className: 'sd-btn', style: smallBtn, disabled: busy || listLoading, onClick: toggleSelectAll, title: allSelected ? '取消选择当前列表的全部会话' : '选中当前列表的全部会话（跟随过滤与搜索）' },
@@ -742,12 +826,26 @@ window.__ModuleLoader__.load({
             selected.size > 0
               ? h('button', { key: 'c', className: 'sd-btn', style: smallBtn, disabled: busy, onClick: () => setSelected(new Set()) }, '清除')
               : null,
+            showRestore
+              ? h(
+                  'button',
+                  {
+                    key: 'rs',
+                    className: 'sd-btn',
+                    style: { ...smallBtn, marginLeft: 'auto', borderColor: `color-mix(in srgb, ${T.brand} 45%, ${T.border})`, color: T.brand, fontWeight: 600 },
+                    disabled: busy || selected.size === 0,
+                    title: '解除所选会话的归档：侧栏原分组立即可见',
+                    onClick: () => fireBatchUnarchive([...selected]),
+                  },
+                  `还原所选 (${selected.size})`,
+                )
+              : null,
             h(
               'button',
               {
                 key: 'd',
                 className: 'sd-btn',
-                style: { ...smallBtn, marginLeft: 'auto', background: selected.size > 0 ? T.err : 'transparent', borderColor: selected.size > 0 ? T.err : T.border, color: selected.size > 0 ? '#fff' : T.label, fontWeight: 600 },
+                style: { ...smallBtn, marginLeft: showRestore ? 0 : 'auto', background: selected.size > 0 ? T.err : 'transparent', borderColor: selected.size > 0 ? T.err : T.border, color: selected.size > 0 ? '#fff' : T.label, fontWeight: 600 },
                 disabled: busy || selected.size === 0,
                 onClick: () => fireBatchDelete([...selected]),
               },
@@ -788,7 +886,9 @@ window.__ModuleLoader__.load({
               h('div', { key: 'a', style: { fontSize: 12, color: T.secondary, lineHeight: '18px' } },
                 `${archivedSessions.length} 个已归档会话 · 共 ${fmtSize(archivedSessions.reduce((a, s) => a + (s.sizeBytes ?? 0), 0))}；删除后进入回收站，可还原或彻底删除。`),
               h('div', { key: 'b', style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary, var(--dsw-alias-label-secondary))', lineHeight: '17px', marginTop: 2 } },
-                '归档状态无法在线解除（DSH 未提供该接口）；删除后如需找回整个会话，见 README 的 unhide 步骤。'),
+                unarchiveSupported
+                  ? '点击行内「还原」或勾选后批量还原：会话立即回到侧栏原分组，无需重启。'
+                  : '当前 DSH 版本不支持在线解除归档；如需找回，见 README 的 unhide 步骤。'),
             ],
           )
         }

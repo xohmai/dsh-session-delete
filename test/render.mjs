@@ -85,8 +85,21 @@ await test('归档页签有数据：行 + 页脚（全选/删除所选）+ 工�
   assert.ok(html.includes('第二个'), '第二行')
   assert.ok(html.includes('全选'), '页脚全选按钮（上次事故点）')
   assert.ok(html.includes('删除所选'), '页脚批量删除按钮')
+  assert.ok(html.includes('还原</button>'), '行内还原按钮（在线解除归档）')
+  assert.ok(html.includes('还原所选'), '页脚批量还原按钮')
+  assert.ok(html.includes('立即回到侧栏'), '工具条在线还原提示')
   assert.ok(html.includes('2 个已归档会话'), '工具条统计')
   assert.ok(html.includes('确认删除') === false, '未武装时不应出现确认删除')
+})
+
+await test('归档页签（旧版 DSH 无在线解档）：无还原入口 + 保留离线提示', () => {
+  const html = renderToString(h(SettingsPage, {
+    close: () => {}, currentId: 'x', initialList: [mkSession()], initialWorkspaces: [],
+    initialUnarchiveSupported: false,
+  }))
+  assert.ok(!html.includes('还原</button>'), '不应有行内还原按钮')
+  assert.ok(!html.includes('还原所选'), '不应有批量还原按钮')
+  assert.ok(html.includes('unhide'), '应保留离线 unhide 指引')
 })
 
 await test('全部会话页签有数据：分组头 + 行 + 搜索/过滤工具条', () => {

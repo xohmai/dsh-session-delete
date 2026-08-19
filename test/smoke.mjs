@@ -55,6 +55,14 @@ const ctx = {
       return [...archived]
     },
     list: () => [{ id: 'w1', title: 'project-a', path: cwdA }],
+    // 与真实 WorkspaceRegistry 同构的内部状态机（在线取消归档所依赖）：
+    // enqueueOperation 串行、requireState 读快照、setState 整体替换并落盘
+    enqueueOperation: (op) => op(),
+    requireState: () => ({ initialized: true, workspaceIds: ['w1'], archivedSessionIds: [...archived] }),
+    setState: async (state) => {
+      archived.clear()
+      for (const id of state.archivedSessionIds ?? []) archived.add(id)
+    },
   },
   agents: {
     get: (id) => (running.get(id) ? { status: 'running' } : undefined),
@@ -133,6 +141,7 @@ const P = '/api/session-delete'
       assert.equal(r.status, 200)
       assert.equal(r.body.sessions.length, 3)
       assert.equal(r.body.workspaces[0].title, 'project-a')
+      assert.equal(r.body.unarchiveSupported, true, '/list 应上报在线解档能力')
       const a1 = r.body.sessions.find((s) => s.id.endsWith('0001'))
       assert.equal(a1.sizeBytes, 500)
       assert.equal(a1.archived, false)
@@ -207,14 +216,15 @@ const P = '/api/session-delete'
       assert.equal(r.body.items[0].sizeBytes, 500)
     })
 
-    await test('POST /restore 原位还原 + stillArchived 提示', async () => {
+    await test('POST /restore 原位还原 + 自动解除归档', async () => {
       const r0 = res()
       await routes.get(`${P}/trash`)(get(`${P}/trash`), r0)
       const entry = r0.body.items[0].entry
       const r = res()
       await routes.get(`${P}/restore`)(bodyReq('POST', `${P}/restore`, { entry }), r)
       assert.equal(r.status, 200, JSON.stringify(r.body))
-      assert.equal(r.body.stillArchived, true)
+      assert.equal(r.body.stillArchived, false, '还原后应自动解除归档')
+      assert.ok(!archived.has('session-aaaa1111-0000-4000-8000-000000000001'), '归档集应移除该 id')
       const restored = join(sessionsRoot, slug(cwdA), 'session-aaaa1111-0000-4000-8000-000000000001')
       assert.ok(await stat(join(restored, 'session.jsonl.zstd')).then(() => true, () => false))
       // 回收站条目应被清掉；还原后重新加入磁盘清单（模拟真实扫描）
@@ -222,6 +232,32 @@ const P = '/api/session-delete'
       await routes.get(`${P}/trash`)(get(`${P}/trash`), r1)
       assert.equal(r1.body.items.length, 0)
       headers.push({ type: 'session', version: 1, id: 'session-aaaa1111-0000-4000-8000-000000000001', createdAt: Date.now(), delegationDepth: 0, cwd: cwdA })
+    })
+
+    await test('POST /unarchive 在线解除归档（幂等 + 审计）', async () => {
+      const id = 'session-aaaa2222-0000-4000-8000-000000000002'
+      await ctx.workspaceRegistry.archiveSession(id) // 模拟侧栏「归档会话」
+      const r = res()
+      await routes.get(`${P}/unarchive`)(bodyReq('POST', `${P}/unarchive`, { id }), r)
+      assert.equal(r.status, 200, JSON.stringify(r.body))
+      assert.equal(r.body.changed, true)
+      assert.ok(!archived.has(id), '归档集应移除该 id')
+      const auditText = await readFile(join(home, 'trash', 'sessions', 'audit.log'), 'utf8')
+      assert.ok(auditText.includes('"action":"unarchive"') && auditText.includes(id), '应写审计行')
+      // 幂等：未归档的 id 直接成功（changed:false），不再写审计
+      const r2 = res()
+      await routes.get(`${P}/unarchive`)(bodyReq('POST', `${P}/unarchive`, { id }), r2)
+      assert.equal(r2.status, 200)
+      assert.equal(r2.body.changed, false)
+    })
+
+    await test('POST /unarchive 非法 id → 400 / 缺自定义头 → 403', async () => {
+      const r = res()
+      await routes.get(`${P}/unarchive`)(bodyReq('POST', `${P}/unarchive`, { id: '../../etc' }), r)
+      assert.equal(r.status, 400)
+      const r2 = res()
+      await routes.get(`${P}/unarchive`)(bodyReq('POST', `${P}/unarchive`, { id: 'session-aaaa2222-0000-4000-8000-000000000002' }, false), r2)
+      assert.equal(r2.status, 403)
     })
 
     await test('POST /purge 单条彻底删除', async () => {
@@ -302,6 +338,38 @@ const P = '/api/session-delete'
       await routes.get(`${P}/delete`)(badReq, r)
       assert.equal(r.status, 400)
       assert.equal(r.body.error.code, 'INVALID_BODY')
+    })
+
+    await test('旧版回退：registry 无内部状态机 → 501 + 还原保留归档态', async () => {
+      const reg = ctx.workspaceRegistry
+      const internals = { enqueueOperation: reg.enqueueOperation, requireState: reg.requireState, setState: reg.setState }
+      delete reg.enqueueOperation
+      delete reg.requireState
+      delete reg.setState
+
+      const rList = res()
+      await routes.get(`${P}/list`)(get(`${P}/list`), rList)
+      assert.equal(rList.body.unarchiveSupported, false, '/list 应上报能力缺失')
+
+      const rUn = res()
+      await routes.get(`${P}/unarchive`)(bodyReq('POST', `${P}/unarchive`, { id: 'session-dddd5555-0000-4000-8000-000000000005' }), rUn)
+      assert.equal(rUn.status, 501)
+      assert.equal(rUn.body.error.code, 'UNSUPPORTED')
+
+      // 该模式下回收站还原回到旧行为（文件还原、归档态保留），客户端据此提示离线步骤
+      await createSession('session-dddd5555-0000-4000-8000-000000000005', cwdA, 64)
+      const rDel = res()
+      await routes.get(`${P}/delete`)(bodyReq('POST', `${P}/delete`, { id: 'session-dddd5555-0000-4000-8000-000000000005' }), rDel)
+      assert.equal(rDel.status, 200)
+      headers.splice(headers.findIndex((x) => x.id === 'session-dddd5555-0000-4000-8000-000000000005'), 1)
+      const r0 = res()
+      await routes.get(`${P}/trash`)(get(`${P}/trash`), r0)
+      const rRestore = res()
+      await routes.get(`${P}/restore`)(bodyReq('POST', `${P}/restore`, { entry: r0.body.items.at(-1).entry }), rRestore)
+      assert.equal(rRestore.status, 200, JSON.stringify(rRestore.body))
+      assert.equal(rRestore.body.stillArchived, true, '无内部状态机时还原应保留归档态')
+
+      Object.assign(reg, internals) // 恢复内部方法，不影响已完成的断言
     })
 
     await rm(home, { recursive: true, force: true })

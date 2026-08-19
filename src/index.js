@@ -8,7 +8,8 @@
  *   GET  /api/session-delete/preview?id=    单会话删除预览
  *   POST /api/session-delete/delete         { id } 归档 + 移入回收站
  *   GET  /api/session-delete/trash          回收站清单
- *   POST /api/session-delete/restore        { entry } 原位还原
+ *   POST /api/session-delete/restore        { entry } 原位还原 + 自动解除归档
+ *   POST /api/session-delete/unarchive      { id } 在线解除归档（旧版回退 501）
  *   POST /api/session-delete/purge          { entry? , all? } 彻底删除
  *
  * 删除流水线（顺序不可换）：
@@ -22,8 +23,12 @@
  * 审计：<DSH_HOME>/trash/sessions/audit.log（JSONL 追加）。
  *
  * 已知边界（有意为之，见 README）：
- *   - 归档集没有官方 unarchive API；restore 只还原磁盘文件，会话默认仍对
- *     侧栏隐藏。彻底找回需在 DSH 停止时运行 tools/unhide.mjs。
+ *   - 取消归档没有公开 API，走 registry 内部状态机（enqueueOperation /
+ *     requireState / setState，与 archiveSession 同源）。setState 落盘触发
+ *     domain/changed(workspace)，宿主 apiproxy 检测到归档集变化后自动广播
+ *     host/archived-sessions-changed，侧栏即时恢复——与归档传播完全对称。
+ *     能力探测失败（未来版本内部变更）时回退 501 UNSUPPORTED，客户端提示
+ *     停止 DSH 后运行 tools/unhide.mjs，与旧版行为一致。
  *   - 投影缓存 session_projcache.json 中可能残留死条目（无害，重启自愈）。
  *   - 搜索索引（sqlite）按磁盘清单 reconcile，文件消失后自动清行。
  */
@@ -151,6 +156,44 @@ export function apply(ctx) {
     } catch {
       return new Set()
     }
+  }
+
+  /**
+   * 在线取消归档（archiveSession 的对称反操作）。
+   *
+   * registry 没有公开的 unarchive API，但其内部状态机与归档同源：
+   * enqueueOperation（串行队列）→ requireState → setState（写 global 存储）。
+   * setState 落盘触发 domain/changed(workspace)，apiproxy 检测到
+   * archivedSessionIds 变化后向所有客户端广播 host/archived-sessions-changed，
+   * 侧栏原分组即时恢复显示——无需自建任何通知管道。
+   *
+   * 这些是内部方法而非公开契约：能力探测失败（未来版本改名/收窄）时抛
+   * 501 UNSUPPORTED，由客户端回退到「停止 DSH 后运行 tools/unhide.mjs」。
+   */
+  function registryCanUnarchive() {
+    const registry = ctx.workspaceRegistry
+    return (
+      typeof registry?.enqueueOperation === 'function' &&
+      typeof registry?.requireState === 'function' &&
+      typeof registry?.setState === 'function'
+    )
+  }
+
+  async function unarchiveSession(id) {
+    if (!registryCanUnarchive()) {
+      throw httpError(501, 'UNSUPPORTED', '当前 DSH 的 workspaceRegistry 不支持在线取消归档；请停止 DSH 后运行 tools/unhide.mjs')
+    }
+    const registry = ctx.workspaceRegistry
+    // 走 registry 自己的串行队列，与并发的归档/工作区写操作互斥
+    return registry.enqueueOperation(async () => {
+      const state = registry.requireState()
+      if (!Array.isArray(state.archivedSessionIds) || !state.archivedSessionIds.includes(id)) return false
+      await registry.setState({
+        ...state,
+        archivedSessionIds: state.archivedSessionIds.filter((x) => x !== id),
+      })
+      return true
+    })
   }
 
   /** 标题批量折叠（sessionQuery 可选；失败逐项回退）。 */
@@ -394,8 +437,19 @@ export function apply(ctx) {
     await mkdir(dirname(targetDir), { recursive: true })
     await rename(dataDir, targetDir)
     await rm(entryDir, { recursive: true, force: true }).catch(() => {})
-    const stillArchived = archivedSet().has(meta.id)
-    await audit('restore', { id: meta.id, entry })
+    // 文件已归位，紧接着在线解除归档：会话直接回到侧栏原分组，一步到位。
+    // 旧版 DSH（无内部状态机）保持旧行为：文件还原、归档态保留，由客户端
+    // 提示离线 unhide 步骤——文件操作永远不因解档失败而回滚。
+    let stillArchived = archivedSet().has(meta.id)
+    if (stillArchived) {
+      try {
+        await unarchiveSession(meta.id)
+      } catch {
+        /* UNSUPPORTED（旧版）或内部失败：归档态保留，走提示路径 */
+      }
+      stillArchived = archivedSet().has(meta.id)
+    }
+    await audit('restore', { id: meta.id, entry, unarchived: !stillArchived })
     recordCache.delete(meta.id)
     return { id: meta.id, ok: true, stillArchived }
   }
@@ -477,7 +531,13 @@ export function apply(ctx) {
             )
             .catch(() => []),
         ])
-        sendJson(res, 200, { ok: true, sessions, workspaces, archivedCount: sessions.filter((s) => s.archived).length })
+        sendJson(res, 200, {
+          ok: true,
+          sessions,
+          workspaces,
+          archivedCount: sessions.filter((s) => s.archived).length,
+          unarchiveSupported: registryCanUnarchive(),
+        })
       }),
     }),
   )
@@ -532,6 +592,23 @@ export function apply(ctx) {
         const body = await readBody(req)
         const result = await restoreSession(body.entry)
         sendJson(res, 200, { ok: true, ...result })
+      }),
+    }),
+  )
+
+  ctx.effect(() =>
+    ctx.webServer.register({
+      kind: 'exact',
+      path: `${PREFIX}/unarchive`,
+      handler: guard(async (req, res) => {
+        if (req.method !== 'POST') return sendJson(res, 405, { error: { code: 'METHOD', message: 'POST only' } })
+        const body = await readBody(req)
+        if (typeof body.id !== 'string' || !ID_RE.test(body.id)) {
+          throw httpError(400, 'INVALID_ID', '会话 id 非法')
+        }
+        const changed = await unarchiveSession(body.id)
+        if (changed) await audit('unarchive', { id: body.id })
+        sendJson(res, 200, { ok: true, id: body.id, changed })
       }),
     }),
   )
