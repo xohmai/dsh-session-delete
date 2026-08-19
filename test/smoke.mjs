@@ -139,6 +139,13 @@ const P = '/api/session-delete'
       assert.ok(a1.mtimeMs > 0)
       // title 必须是字符串（SessionTitleSnapshot 已解包），否则客户端渲染报 React #31
       assert.ok(typeof a1.title === 'string' && a1.title.startsWith('会话 '), `title 应为字符串，实际: ${JSON.stringify(a1.title)}`)
+      // 缓存路径：第二次 /list 命中 mtime 缓存，结果必须与首次一致
+      const r2 = res()
+      await routes.get(`${P}/list`)(get(`${P}/list`), r2)
+      assert.equal(r2.status, 200)
+      const a1b = r2.body.sessions.find((s) => s.id.endsWith('0001'))
+      assert.strictEqual(a1b.title, a1.title, '缓存命中的 title 应与首次一致')
+      assert.strictEqual(a1b.sizeBytes, a1.sizeBytes)
     })
 
     await test('GET /preview 命中单个会话', async () => {

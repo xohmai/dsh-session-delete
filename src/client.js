@@ -363,6 +363,12 @@ window.__ModuleLoader__.load({
       }, [arm, purgeAllArmed])
 
       // ---------- 动作 ----------
+      /** 删除成功后本地移除对应行（免整表重拉；手动 ↻ 或切页签会重新加载）。 */
+      function removeDeletedLocally(okIds) {
+        if (list === null || okIds.length === 0) return
+        const gone = new Set(okIds)
+        setList(list.filter((s) => !gone.has(s.id)))
+      }
       /** 成功删除的会话体积合计（按删除前清单精确计算）。 */
       const sizeById = new Map((list ?? []).map((s) => [s.id, s.sizeBytes ?? 0]))
       const freedOf = (okIds) => okIds.reduce((acc, id) => acc + (sizeById.get(id) ?? 0), 0)
@@ -384,7 +390,7 @@ window.__ModuleLoader__.load({
           } else {
             setNotice({ kind: 'err', title: '删除失败', detail: r.message, at: at() })
           }
-          await loadList()
+          removeDeletedLocally(r.okIds)
         } finally {
           setBusy(false)
           setSelected(new Set())
@@ -412,7 +418,7 @@ window.__ModuleLoader__.load({
           } else {
             setNotice({ kind: 'err', title: `全部删除失败（${r.failed} 个）`, detail: r.message, at: at() })
           }
-          await loadList()
+          removeDeletedLocally(r.okIds)
         } finally {
           setBusy(false)
           setProgress(null)
@@ -764,10 +770,12 @@ window.__ModuleLoader__.load({
         if (tab === 'archived' && archivedSessions.length > 0) {
           return h(
             'div',
-            { key: 'tb-arch', style: { fontSize: 12, color: T.secondary, margin: '10px 0 0', lineHeight: '18px', flex: 'none' } },
+            { key: 'tb-arch', style: { margin: '10px 0 0', flex: 'none' } },
             [
-              h('span', { key: 'a' }, `${archivedSessions.length} 个已归档会话 · 共 ${fmtSize(archivedSessions.reduce((a, s) => a + (s.sizeBytes ?? 0), 0))}；`),
-              h('span', { key: 'b' }, '删除后进入回收站，可在「回收站」页签还原或彻底删除。'),
+              h('div', { key: 'a', style: { fontSize: 12, color: T.secondary, lineHeight: '18px' } },
+                `${archivedSessions.length} 个已归档会话 · 共 ${fmtSize(archivedSessions.reduce((a, s) => a + (s.sizeBytes ?? 0), 0))}；删除后进入回收站，可还原或彻底删除。`),
+              h('div', { key: 'b', style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary, var(--dsw-alias-label-secondary))', lineHeight: '17px', marginTop: 2 } },
+                '归档状态无法在线解除（DSH 未提供该接口）；删除后如需找回整个会话，见 README 的 unhide 步骤。'),
             ],
           )
         }

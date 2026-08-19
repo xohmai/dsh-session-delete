@@ -173,31 +173,76 @@ export function apply(ctx) {
     }
   }
 
+  /**
+   * 记录缓存：id → { key, title, sizeBytes, mtimeMs }。
+   * key = 日志文件 `mtime:size`——标题折叠需要 zstd 解压整个日志（44 个会话
+   * 约 0.7s），但内容只有追加一种变化方式，文件 mtime+size 不变即可复用。
+   * live 会话不缓存（内存态可能领先于磁盘）。
+   */
+  const recordCache = new Map()
+
   /** 会话记录（list/preview 共用）：磁盘 + 归档 + agent 状态 + 占用。 */
   async function sessionRecords(ids) {
     const { byId } = await inventory()
     const archived = archivedSet()
     const target = ids ?? [...byId.keys()]
-    const titles = await titlesFor(target)
+
+    // 第一遍（并行）：定位 + stat 日志文件，判定缓存命中
+    const prep = (
+      await Promise.all(
+        target.map(async (id) => {
+          const header = byId.get(id)
+          if (header === undefined) return null
+          const location = ctx.sessionPersistence.locate(header)
+          const dir = location && typeof location.path === 'string' ? dirname(location.path) : null
+          let key = null
+          if (location && typeof location.path === 'string') {
+            try {
+              const st = await stat(location.path)
+              key = `${st.mtimeMs}:${st.size}`
+            } catch {
+              key = null
+            }
+          }
+          const agent = agentState(id)
+          const cached = recordCache.get(id)
+          const hit = !agent.live && key !== null && cached !== undefined && cached.key === key
+          return { id, header, dir, key, agent, cached, hit }
+        }),
+      )
+    ).filter((p) => p !== null)
+
+    // 只对未命中的会话做标题折叠（这是主要成本）；live 会话永远新鲜读取
+    const titles = await titlesFor(prep.filter((p) => !p.hit).map((p) => p.id))
+
     const records = []
-    for (const id of target) {
-      const header = byId.get(id)
-      if (header === undefined) continue
-      const location = ctx.sessionPersistence.locate(header)
-      const dir = location && typeof location.path === 'string' ? dirname(location.path) : null
-      const agent = agentState(id)
+    for (const p of prep) {
+      let title
+      let sizeBytes
+      let mtimeMs
+      if (p.hit) {
+        title = p.cached.title
+        sizeBytes = p.cached.sizeBytes
+        mtimeMs = p.cached.mtimeMs
+      } else {
+        title = typeof titles.get(p.id) === 'string' ? titles.get(p.id) : null
+        sizeBytes = p.dir ? await dirSize(p.dir) : 0
+        mtimeMs = p.dir ? await dirMtime(p.dir) : 0
+        if (p.key !== null) recordCache.set(p.id, { key: p.key, title, sizeBytes, mtimeMs })
+        else recordCache.delete(p.id)
+      }
       records.push({
-        id,
-        cwd: header.cwd ?? null,
-        createdAt: header.createdAt ?? null,
-        origin: header.origin ?? null,
-        delegationDepth: header.delegationDepth ?? 0,
-        title: typeof titles.get(id) === 'string' ? titles.get(id) : null,
-        archived: archived.has(id),
-        live: agent.live,
-        running: agent.running,
-        sizeBytes: dir ? await dirSize(dir) : 0,
-        mtimeMs: dir ? await dirMtime(dir) : 0,
+        id: p.id,
+        cwd: p.header.cwd ?? null,
+        createdAt: p.header.createdAt ?? null,
+        origin: p.header.origin ?? null,
+        delegationDepth: p.header.delegationDepth ?? 0,
+        title,
+        archived: archived.has(p.id),
+        live: p.agent.live,
+        running: p.agent.running,
+        sizeBytes,
+        mtimeMs,
       })
     }
     records.sort((a, b) => b.mtimeMs - a.mtimeMs)
@@ -264,6 +309,7 @@ export function apply(ctx) {
       ),
     )
     await audit('delete', { id, entry })
+    recordCache.delete(id)
     return { id, ok: true, entry }
   }
 
@@ -324,6 +370,7 @@ export function apply(ctx) {
     await rm(entryDir, { recursive: true, force: true }).catch(() => {})
     const stillArchived = archivedSet().has(meta.id)
     await audit('restore', { id: meta.id, entry })
+    recordCache.delete(meta.id)
     return { id: meta.id, ok: true, stillArchived }
   }
 
