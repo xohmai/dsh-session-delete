@@ -295,10 +295,12 @@ window.__ModuleLoader__.load({
     function SettingsPage(props) {
       const currentId = props?.currentId
 
-      const [tab, setTab] = useState('archived') // archived | all | trash
-      const [list, setList] = useState(null)
-      const [workspaces, setWorkspaces] = useState([])
-      const [trash, setTrash] = useState(null)
+      // 可选 initial* 用于测试注入（生产恒为 undefined → 走 fetch 加载），
+      // 让渲染测试能确定性覆盖「有数据」的分支（页脚/行/分组头等）。
+      const [tab, setTab] = useState(props?.initialTab ?? 'archived') // archived | all | trash
+      const [list, setList] = useState(props?.initialList ?? null)
+      const [workspaces, setWorkspaces] = useState(props?.initialWorkspaces ?? [])
+      const [trash, setTrash] = useState(props?.initialTrash ?? null)
       // 按数据域独立的加载/错误状态：回收站后台刷新不会干扰会话页签的按钮与错误提示
       const [listLoading, setListLoading] = useState(false)
       const [listError, setListError] = useState(null)
@@ -734,7 +736,7 @@ window.__ModuleLoader__.load({
             h('span', { key: 'n', style: { fontSize: 12, color: T.secondary } }, busy ? `删除中 ${progress?.done ?? 0}/${progress?.total ?? 0}` : `已选 ${selected.size} 项 · ${fmtSize(selectedBytes(rows))}`),
             h(
               'button',
-              { key: 'all', className: 'sd-btn', style: smallBtn, disabled: busy || loading, onClick: toggleSelectAll, title: allSelected ? '取消选择当前列表的全部会话' : '选中当前列表的全部会话（跟随过滤与搜索）' },
+              { key: 'all', className: 'sd-btn', style: smallBtn, disabled: busy || listLoading, onClick: toggleSelectAll, title: allSelected ? '取消选择当前列表的全部会话' : '选中当前列表的全部会话（跟随过滤与搜索）' },
               allSelected ? '取消全选' : `全选 (${rows.length})`,
             ),
             selected.size > 0
