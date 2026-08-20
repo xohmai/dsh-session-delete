@@ -23,8 +23,8 @@ dsh plugin --profile web add github:xohmai/dsh-session-delete
 **方式二：tarball 离线分发（内网场景）**
 
 ```sh
-npm pack                                               # 产出 dsh-session-delete-0.1.0.tgz
-dsh plugin --profile web add ./dsh-session-delete-0.1.0.tgz
+npm pack                                               # 产出 dsh-session-delete-0.2.0.tgz
+dsh plugin --profile web add ./dsh-session-delete-0.2.0.tgz
 ```
 
 ## 使用
