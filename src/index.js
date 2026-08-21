@@ -42,8 +42,18 @@ export const inject = ['webServer', 'sessionPersistence', 'workspaceRegistry', '
 const PREFIX = '/api/session-delete'
 /** 自定义头防跨站 POST（见文件头注释）。 */
 const PLUGIN_HEADER = 'x-dsh-plugin'
-/** 会话 id 白名单：session-<uuid> 形态，宽进严出（仍要求存在于磁盘清单）。 */
-const ID_RE = /^session-[A-Za-z0-9-]{8,80}$/
+/**
+ * 会话 id 白名单（宽进严出：仍要求存在于磁盘清单，见 inventory()）。
+ * 接受 DSH 核心实际生成的三种会话 id 形态：
+ *   - session-<uuid>              主会话（dsh-headless / dsh-session 生成）
+ *   - <uuid>                      可延续子代理（dsh-subagent startContinuable 生成裸 UUID）
+ *   - <id>-session-<uuid>         配置子代理（dsh-agent-loop 生成）
+ * 长度上限 80 与回收站条目名白名单 ENTRY_RE（{1,120}）保持兼容：
+ * 条目名 = <UTC 紧凑时间戳 15 字符> + '-' + id，15 + 1 + 80 = 96 ≤ 120，
+ * 因此任何被本插件删除的会话其回收站条目必然能 restore / purge（不会自造不可还原条目）。
+ * 字符集 [A-Za-z0-9-] 拒绝 `/`、`\`、`.`、`..`、引号等路径穿越载荷。
+ */
+const ID_RE = /^[A-Za-z0-9-]{8,80}$/
 /** 回收站条目名白名单（时间戳-id，无路径分隔符）。 */
 const ENTRY_RE = /^[A-Za-z0-9._-]{1,120}$/
 /** 回收站根内的保留文件名（审计日志），不可作为条目操作。 */

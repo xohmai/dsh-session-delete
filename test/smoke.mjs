@@ -330,6 +330,60 @@ const P = '/api/session-delete'
       assert.equal(r.status, 400)
     })
 
+    await test('非 session- 前缀的合法 id 形态可正常操作（裸 UUID 子代理 / <id>-session-<uuid> 配置子代理）', async () => {
+      // 可延续子代理：dsh-subagent startContinuable 生成裸 UUID（无 session- 前缀）
+      const bareUuid = '123e4567-e89b-42d3-a456-426614174000'
+      // 配置子代理：dsh-agent-loop 生成 <id>-session-<uuid>
+      const configured = 'researcher-session-11111111-2222-4333-8444-555555555555'
+      await createSession(bareUuid, cwdA, 64)
+      await createSession(configured, cwdA, 64)
+
+      // preview 均应 200（修复前裸 UUID 形态被 ID_RE 拒绝 → 400）
+      for (const id of [bareUuid, configured]) {
+        const r = res()
+        await routes.get(`${P}/preview`)(get(`${P}/preview?id=${id}`), r)
+        assert.equal(r.status, 200, `preview ${id} 应 200，实际 ${r.status} ${JSON.stringify(r.body)}`)
+        assert.equal(r.body.session.id, id)
+      }
+
+      // delete 均应 200 且进回收站（修复前裸 UUID 形态在 delete 时被 400 拦截）
+      for (const id of [bareUuid, configured]) {
+        const r = res()
+        await routes.get(`${P}/delete`)(bodyReq('POST', `${P}/delete`, { id }), r)
+        assert.equal(r.status, 200, `delete ${id} 应 200，实际 ${r.status} ${JSON.stringify(r.body)}`)
+        assert.ok(r.body.entry, `delete ${id} 应返回回收站条目`)
+        headers.splice(headers.findIndex((x) => x.id === id), 1)
+      }
+
+      // restore 均应 200 且自动解除归档（回收站条目名 = <时间戳>-<id>，长度仍在 ENTRY_RE 内）
+      for (const id of [bareUuid, configured]) {
+        const rTrash = res()
+        await routes.get(`${P}/trash`)(get(`${P}/trash`), rTrash)
+        const entry = rTrash.body.items.find((i) => i.id === id)?.entry
+        assert.ok(entry, `trash 应包含 ${id} 的条目`)
+        const r = res()
+        await routes.get(`${P}/restore`)(bodyReq('POST', `${P}/restore`, { entry }), r)
+        assert.equal(r.status, 200, `restore ${id} 应 200，实际 ${r.status} ${JSON.stringify(r.body)}`)
+        headers.push({ type: 'session', version: 1, id, createdAt: Date.now(), delegationDepth: 0, cwd: cwdA })
+      }
+    })
+
+    await test('id 白名单边界：过短 / 含非法字符 / 超长（80）均拒绝', async () => {
+      const evil = ['abc', '1234567', 'under_score-12345678', 'has space', 'a'.repeat(81), 'session-' + 'a'.repeat(80)]
+      for (const id of evil) {
+        const r = res()
+        await routes.get(`${P}/preview`)(get(`${P}/preview?id=${encodeURIComponent(id)}`), r)
+        assert.equal(r.status, 400, `id ${JSON.stringify(id.slice(0, 30))} 应 400，实际 ${r.status}`)
+      }
+      // 恰好 80 字符的合法 id 应通过（长度上限边界）
+      const ok80 = 'a'.repeat(80)
+      await createSession(ok80, cwdA, 32)
+      const rOk = res()
+      await routes.get(`${P}/preview`)(get(`${P}/preview?id=${ok80}`), rOk)
+      assert.equal(rOk.status, 200, `80 字符 id 应 200，实际 ${rOk.status}`)
+      headers.splice(headers.findIndex((x) => x.id === ok80), 1)
+    })
+
     await test('回收站条目路径穿越防护：entry=".." / "." / "audit.log" 全部拒绝', async () => {
       // 先删一个会话制造回收站内容，确保攻击发生时目标确实存在
       await createSession('session-cccc4444-0000-4000-8000-000000000004', cwdA, 100)
