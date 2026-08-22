@@ -8,13 +8,50 @@
  * 运行：node test/render.mjs
  */
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
-const NM = '/usr/lib/node_modules/@deepseek-ai/dsh/node_modules'
-const require2 = createRequire(import.meta.url)
-const React = require2(`${NM}/react/index.js`)
-const { renderToString } = require2(`${NM}/react-dom/server.js`)
+/**
+ * Resolve react / react-dom from the local DSH install without hard-coding a
+ * single node_modules layout. Newer DSH trees keep react at the top level but
+ * nest react-dom under a client UI package, and Windows / local wrappers do not
+ * share the Linux global path used by earlier smoke harnesses.
+ */
+function resolveReact() {
+  const requireHere = createRequire(import.meta.url)
+  const anchors = [
+    '/usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-client-ui-trajectory/package.json',
+    '/usr/lib/node_modules/@deepseek-ai/dsh/node_modules/react/package.json',
+    '/usr/lib/node_modules/@deepseek-ai/dsh/package.json',
+    join(dirname(fileURLToPath(import.meta.url)), '../package.json'),
+  ]
+  const errors = []
+  for (const anchor of anchors) {
+    if (!existsSync(anchor)) continue
+    try {
+      const req = createRequire(anchor)
+      return {
+        React: req('react'),
+        renderToString: req('react-dom/server').renderToString,
+      }
+    } catch (error) {
+      errors.push(`${anchor}: ${error.message.split('\n')[0]}`)
+    }
+  }
+  try {
+    return {
+      React: requireHere('react'),
+      renderToString: requireHere('react-dom/server').renderToString,
+    }
+  } catch (error) {
+    errors.push(`import.meta.url: ${error.message.split('\n')[0]}`)
+  }
+  throw new Error(`Unable to resolve react/react-dom for render smoke.\n${errors.join('\n')}`)
+}
+
+const { React, renderToString } = resolveReact()
 
 // ---- 桩 __ModuleLoader__ 捕获 client.js 的 factory ----
 let def = null

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.1
+
+- Accept bare-UUID and `<id>-session-<uuid>` session ids in the host ID whitelist so continuable / configured subagent sessions can be previewed, deleted, and restored (thanks @xi146)
+- Make `test/render.mjs` resolve `react` / `react-dom` from the local DSH install instead of a hard-coded Linux global path
+
 ## 0.2.0
 
 - Online unarchive: restore from the Archived tab returns the session to the sidebar immediately; trash restore also unarchives automatically
