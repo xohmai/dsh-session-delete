@@ -187,6 +187,7 @@ const P = '/api/session-delete'
       await routes.get(`${P}/delete`)(bodyReq('POST', `${P}/delete`, { id }), r)
       assert.equal(r.status, 200, JSON.stringify(r.body))
       assert.equal(archiveCalls.at(-1), id, '必须先调用 archiveSession')
+      assert.ok(!archived.has(id), '删除成功后应清掉 archivedSessionIds ghost')
       assert.ok(r.body.entry.startsWith('20'), r.body.entry)
       const entryDir = join(home, 'trash', 'sessions', r.body.entry)
       const meta = JSON.parse(await readFile(join(entryDir, 'meta.json'), 'utf8'))
@@ -198,6 +199,7 @@ const P = '/api/session-delete'
       assert.ok(!(await stat(dirBefore).then(() => true, () => false)), '原目录应消失')
       const audit = await readFile(join(home, 'trash', 'sessions', 'audit.log'), 'utf8')
       assert.ok(audit.includes(`"action":"delete"`) && audit.includes(id))
+      assert.ok(audit.includes('"forgottenArchived":true'), '审计应记录清理了归档 ghost')
       // 磁盘清单不再包含该会话（桩的 list 模拟真实扫描）
       headers.splice(headers.findIndex((x) => x.id === id), 1)
     })
@@ -263,30 +265,38 @@ const P = '/api/session-delete'
     })
 
     await test('POST /purge 单条彻底删除', async () => {
+      const id = 'session-aaaa2222-0000-4000-8000-000000000002'
       const rDel = res()
-      await routes.get(`${P}/delete`)(bodyReq('POST', `${P}/delete`, { id: 'session-aaaa2222-0000-4000-8000-000000000002' }), rDel)
+      await routes.get(`${P}/delete`)(bodyReq('POST', `${P}/delete`, { id }), rDel)
       assert.equal(rDel.status, 200)
-      headers.splice(headers.findIndex((x) => x.id === 'session-aaaa2222-0000-4000-8000-000000000002'), 1)
+      assert.ok(!archived.has(id), 'delete 已清 ghost')
+      // 模拟旧数据：回收站条目仍在，但 archivedSessionIds 又被写回 ghost
+      archived.add(id)
+      headers.splice(headers.findIndex((x) => x.id === id), 1)
       const r0 = res()
       await routes.get(`${P}/trash`)(get(`${P}/trash`), r0)
       const entry = r0.body.items[0].entry
       const r = res()
       await routes.get(`${P}/purge`)(bodyReq('POST', `${P}/purge`, { entry }), r)
       assert.equal(r.status, 200)
+      assert.ok(!archived.has(id), 'purge 单条也应清掉 archivedSessionIds ghost')
       const r1 = res()
       await routes.get(`${P}/trash`)(get(`${P}/trash`), r1)
       assert.equal(r1.body.items.length, 0)
     })
 
     await test('POST /purge all 清空回收站', async () => {
+      const id = 'session-bbbb3333-0000-4000-8000-000000000003'
       const rDel = res()
-      await routes.get(`${P}/delete`)(bodyReq('POST', `${P}/delete`, { id: 'session-bbbb3333-0000-4000-8000-000000000003' }), rDel)
+      await routes.get(`${P}/delete`)(bodyReq('POST', `${P}/delete`, { id }), rDel)
       assert.equal(rDel.status, 200)
-      headers.splice(headers.findIndex((x) => x.id === 'session-bbbb3333-0000-4000-8000-000000000003'), 1)
+      archived.add(id) // 模拟残留 ghost，验证 purge-all 批量清理
+      headers.splice(headers.findIndex((x) => x.id === id), 1)
       const r = res()
       await routes.get(`${P}/purge`)(bodyReq('POST', `${P}/purge`, { all: true }), r)
       assert.equal(r.status, 200)
       assert.equal(r.body.count, 1)
+      assert.ok(!archived.has(id), 'purge-all 也应清掉 archivedSessionIds ghost')
       const left = await readdir(join(home, 'trash', 'sessions')).then((xs) => xs.filter((x) => x !== 'audit.log'))
       assert.equal(left.length, 0)
     })
@@ -444,6 +454,10 @@ const P = '/api/session-delete'
       const rDel = res()
       await routes.get(`${P}/delete`)(bodyReq('POST', `${P}/delete`, { id: 'session-dddd5555-0000-4000-8000-000000000005' }), rDel)
       assert.equal(rDel.status, 200)
+      assert.ok(
+        archived.has('session-dddd5555-0000-4000-8000-000000000005'),
+        '旧版无状态机时 delete 仍会留下 archivedSessionIds（无法在线清 ghost）',
+      )
       headers.splice(headers.findIndex((x) => x.id === 'session-dddd5555-0000-4000-8000-000000000005'), 1)
       const r0 = res()
       await routes.get(`${P}/trash`)(get(`${P}/trash`), r0)

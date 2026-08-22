@@ -6,11 +6,11 @@
  * 预检，而本服务不答 CORS 预检）：
  *   GET  /api/session-delete/list           全量会话清单（清理面板数据源）
  *   GET  /api/session-delete/preview?id=    单会话删除预览
- *   POST /api/session-delete/delete         { id } 归档 + 移入回收站
+ *   POST /api/session-delete/delete         { id } 归档 + 移入回收站 + 清归档 ghost
  *   GET  /api/session-delete/trash          回收站清单
  *   POST /api/session-delete/restore        { entry } 原位还原 + 自动解除归档
  *   POST /api/session-delete/unarchive      { id } 在线解除归档（旧版回退 501）
- *   POST /api/session-delete/purge          { entry? , all? } 彻底删除
+ *   POST /api/session-delete/purge          { entry? , all? } 彻底删除 + 清归档 ghost
  *
  * 删除流水线（顺序不可换）：
  *   1. 运行保护：agents.get(id) 存在且 status !== 'idle' → 拒绝
@@ -18,7 +18,10 @@
  *      官方实现要求会话「live 或仍在持久化清单中」，归档后宿主会向客户端
  *      广播 host/archived-sessions-changed，侧栏即时隐藏；
  *   3. sessionPersistence.locate(header) 定位真实磁盘目录（不硬编码路径）；
- *   4. rename 移入 <DSH_HOME>/trash/sessions/<时间戳>-<id>/data/（回收站）。
+ *   4. rename 移入 <DSH_HOME>/trash/sessions/<时间戳>-<id>/data/（回收站）；
+ *   5. 尽力从 global.archivedSessionIds 移除该 id（见 forgetArchivedSessions）：
+ *      删除先归档会把 id 写进 workspace.json；若不清理，官方归档计数会留下
+ *      ghost。回收站还原仍会再次解除归档，所以这一步是删盘后的对称收尾。
  *
  * 审计：<DSH_HOME>/trash/sessions/audit.log（JSONL 追加）。
  *
@@ -27,8 +30,8 @@
  *     requireState / setState，与 archiveSession 同源）。setState 落盘触发
  *     domain/changed(workspace)，宿主 apiproxy 检测到归档集变化后自动广播
  *     host/archived-sessions-changed，侧栏即时恢复——与归档传播完全对称。
- *     能力探测失败（未来版本内部变更）时回退 501 UNSUPPORTED，客户端提示
- *     停止 DSH 后运行 tools/unhide.mjs，与旧版行为一致。
+ *     能力探测失败（未来版本内部变更）时：/unarchive 回退 501 UNSUPPORTED；
+ *     删除/清空路径的 ghost 清理改为静默跳过（旧版无法改 archivedSessionIds）。
  *   - 投影缓存 session_projcache.json 中可能残留死条目（无害，重启自愈）。
  *   - 搜索索引（sqlite）按磁盘清单 reconcile，文件消失后自动清行。
  */
@@ -206,6 +209,37 @@ export function apply(ctx) {
     })
   }
 
+  /**
+   * 删除/清空后的归档 ghost 清理（best-effort）。
+   *
+   * delete 会先 archiveSession 再移盘：id 因此留在 workspace.json 的
+   * global.archivedSessionIds 里。磁盘会话已不存在时，官方归档计数仍会虚高。
+   * 这里在文件操作成功后批量摘掉这些 id；旧版无内部状态机时静默跳过，
+   * 清理失败也不回滚已完成的删除/清空。
+   */
+  async function forgetArchivedSessions(ids) {
+    const wanted = [...new Set((ids ?? []).filter((id) => typeof id === 'string' && id))]
+    if (wanted.length === 0 || !registryCanUnarchive()) return 0
+    const registry = ctx.workspaceRegistry
+    const drop = new Set(wanted)
+    try {
+      return await registry.enqueueOperation(async () => {
+        const state = registry.requireState()
+        if (!Array.isArray(state.archivedSessionIds) || state.archivedSessionIds.length === 0) return 0
+        const next = state.archivedSessionIds.filter((id) => !drop.has(id))
+        const removed = state.archivedSessionIds.length - next.length
+        if (removed === 0) return 0
+        await registry.setState({
+          ...state,
+          archivedSessionIds: next,
+        })
+        return removed
+      })
+    } catch {
+      return 0
+    }
+  }
+
   /** 标题批量折叠（sessionQuery 可选；失败逐项回退）。 */
   async function titlesFor(ids) {
     const query = ctx.get('sessionQuery')
@@ -332,7 +366,8 @@ export function apply(ctx) {
     const dir = dirname(location.path)
     if ((await stat(dir).catch(() => undefined)) === undefined) {
       // 目录已不存在（例如此前删了一半）：归档已完成，直接视为成功。
-      await audit('delete', { id, note: 'dir-missing' })
+      const forgotten = await forgetArchivedSessions([id])
+      await audit('delete', { id, note: 'dir-missing', forgottenArchived: forgotten > 0 })
       return { id, ok: true, note: 'dir-missing' }
     }
     const sizeBytes = await dirSize(dir)
@@ -373,7 +408,10 @@ export function apply(ctx) {
         2,
       ),
     )
-    await audit('delete', { id, entry })
+    // 文件已离盘：摘掉刚才 archiveSession 写入的 archivedSessionIds，避免官方
+    // 归档计数留下 ghost。旧版无状态机时 forget 会静默跳过。
+    const forgotten = await forgetArchivedSessions([id])
+    await audit('delete', { id, entry, forgottenArchived: forgotten > 0 })
     recordCache.delete(id)
     return { id, ok: true, entry }
   }
@@ -479,13 +517,23 @@ export function apply(ctx) {
     const root = await trashRoot()
     if (all) {
       const items = await listTrash()
+      const ids = items.map((item) => item.id).filter((id) => typeof id === 'string' && id)
       for (const item of items) await rm(join(root, item.entry), { recursive: true, force: true })
-      await audit('purge-all', { count: items.length })
+      const forgotten = await forgetArchivedSessions(ids)
+      await audit('purge-all', { count: items.length, forgottenArchived: forgotten })
       return { ok: true, count: items.length }
     }
     const entryDir = await resolveTrashEntryDir(entry)
+    let metaId = null
+    try {
+      const meta = JSON.parse(await readFile(join(entryDir, 'meta.json'), 'utf8'))
+      if (typeof meta?.id === 'string' && ID_RE.test(meta.id)) metaId = meta.id
+    } catch {
+      /* meta 缺失/损坏时仍允许清空目录；只是无法定向清理归档 ghost */
+    }
     await rm(entryDir, { recursive: true, force: true })
-    await audit('purge', { entry })
+    const forgotten = metaId ? await forgetArchivedSessions([metaId]) : 0
+    await audit('purge', { entry, id: metaId, forgottenArchived: forgotten > 0 })
     return { ok: true, count: 1 }
   }
 

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.2
+
+- Clear `workspace.json` `global.archivedSessionIds` ghosts after delete / purge so official archive counts do not keep deleted sessions (best-effort when the registry state machine is available)
+
 ## 0.2.1
 
 - Accept bare-UUID and `<id>-session-<uuid>` session ids in the host ID whitelist so continuable / configured subagent sessions can be previewed, deleted, and restored (thanks @xi146)
