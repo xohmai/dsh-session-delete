@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.3
+
+- Reconcile historical `archivedSessionIds` ghosts on `/list`: ids present in `workspace.json` but missing from the on-disk session inventory are removed best-effort
+
 ## 0.2.2
 
 - Clear `workspace.json` `global.archivedSessionIds` ghosts after delete / purge so official archive counts do not keep deleted sessions (best-effort when the registry state machine is available)

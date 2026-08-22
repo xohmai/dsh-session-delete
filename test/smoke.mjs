@@ -157,6 +157,18 @@ const P = '/api/session-delete'
       assert.strictEqual(a1b.sizeBytes, a1.sizeBytes)
     })
 
+    await test('GET /list 会 reconcile 历史 archivedSessionIds ghost', async () => {
+      const ghost = 'session-ghost9999-0000-4000-8000-000000000099'
+      archived.add(ghost)
+      assert.ok(!headers.some((h) => h.id === ghost), 'ghost 不在磁盘清单')
+      const r = res()
+      await routes.get(`${P}/list`)(get(`${P}/list`), r)
+      assert.equal(r.status, 200)
+      assert.ok(!archived.has(ghost), '/list 应清掉磁盘上不存在的归档 ghost')
+      const audit = await readFile(join(home, 'trash', 'sessions', 'audit.log'), 'utf8')
+      assert.ok(audit.includes('"action":"reconcile-archived-ghosts"'), '应写 reconcile 审计')
+    })
+
     await test('GET /preview 命中单个会话', async () => {
       const r = res()
       await routes.get(`${P}/preview`)(get(`${P}/preview?id=session-aaaa1111-0000-4000-8000-000000000001`), r)

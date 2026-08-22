@@ -240,6 +240,22 @@ export function apply(ctx) {
     }
   }
 
+  /**
+   * 清掉「归档集里有、磁盘清单里没有」的历史 ghost。
+   * 覆盖升级前留下的残留；/list 时 best-effort 触发一次即可。
+   */
+  async function reconcileArchivedGhosts() {
+    if (!registryCanUnarchive()) return 0
+    const archived = [...archivedSet()]
+    if (archived.length === 0) return 0
+    const { byId } = await inventory()
+    const ghosts = archived.filter((id) => !byId.has(id))
+    if (ghosts.length === 0) return 0
+    const forgotten = await forgetArchivedSessions(ghosts)
+    if (forgotten > 0) await audit('reconcile-archived-ghosts', { count: forgotten, ids: ghosts.slice(0, 20) })
+    return forgotten
+  }
+
   /** 标题批量折叠（sessionQuery 可选；失败逐项回退）。 */
   async function titlesFor(ids) {
     const query = ctx.get('sessionQuery')
@@ -587,6 +603,8 @@ export function apply(ctx) {
       path: `${PREFIX}/list`,
       handler: guard(async (req, res) => {
         if (req.method !== 'GET') return sendJson(res, 405, { error: { code: 'METHOD', message: 'GET only' } })
+        // 先 reconcile 历史 ghost，再读 sessions：archived 标记与官方计数一致。
+        await reconcileArchivedGhosts()
         const [sessions, workspaces] = await Promise.all([
           sessionRecords(),
           Promise.resolve()
