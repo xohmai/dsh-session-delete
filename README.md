@@ -23,8 +23,8 @@ dsh plugin --profile web add github:xohmai/dsh-session-delete
 **方式二：tarball 离线分发（内网场景）**
 
 ```sh
-npm pack                                               # 产出 dsh-session-delete-0.3.0.tgz
-dsh plugin --profile web add ./dsh-session-delete-0.3.0.tgz
+npm pack                                               # 产出 dsh-session-delete-0.4.0.tgz
+dsh plugin --profile web add ./dsh-session-delete-0.4.0.tgz
 ```
 
 ## 使用
@@ -32,10 +32,10 @@ dsh plugin --profile web add ./dsh-session-delete-0.3.0.tgz
 1. 打开 **设置 → 归档会话**
 2. 在侧栏右键归档的会话出现在「归档会话」页签：行内「还原」解除归档（侧栏原分组立即可见），或删除；「全部会话」页签可处理任意会话
 3. 删除先入回收站（`~/.dsh/trash/sessions/`），「还原」时文件归位并自动解除归档；确定不要再「彻底删除」
-4. 删除 / 清空时会尽量同步清掉 `workspace.json` 里的 `archivedSessionIds` ghost；打开设置页拉清单时也会 reconcile 历史残留，避免官方归档计数虚高
-5. **「打开中」的会话**：宿主把已打开的会话缓存在内存里，删除后若立即解除归档，它会重新出现在侧栏——因此这类会话删除后保持归档隐藏（侧栏不可见），重启 DSH 后彻底消失；回收站还原则不受此限制，随时可完整找回
+4. **删除后不会回到侧栏**：会话的归档 id 在运行期间有意保留（它只是侧栏的隐藏标记；没有行数据的 ghost id 在官方 UI 里不渲染任何东西）。运行期间摘除它会广播归档变更，把已连接客户端列表缓存里的残留行重新显示出来——因此 ghost 统一在重启 DSH 时由启动 reconcile 清理（此刻所有客户端都用全新基线，摘除绝对安全）
+5. 回收站还原不受此限制：文件归位 + 自动解除归档，会话立即回到侧栏原分组
 
-**旧版 DSH 回退**：在线解除归档走 workspaceRegistry 内部状态机，插件启动时自动探测能力；不可用时隐藏还原入口，可在 DSH 停止时运行 `node tools/unhide.mjs <sessionId>` 离线找回。旧版同样无法在线清理删除留下的归档 ghost。
+**旧版 DSH 回退**：在线解除归档走 workspaceRegistry 内部状态机，插件启动时自动探测能力；不可用时隐藏还原入口，可在 DSH 停止时运行 `node tools/unhide.mjs <sessionId>` 离线找回。旧版同样无法在重启时清理归档 ghost（能力缺失时 reconcile 静默跳过）。
 
 ## 开发
 

@@ -159,16 +159,17 @@ const P = '/api/session-delete'
       assert.strictEqual(a1b.sizeBytes, a1.sizeBytes)
     })
 
-    await test('GET /list 会 reconcile 历史 archivedSessionIds ghost', async () => {
+    await test('运行期间 /list 不清归档 ghost（防止长连客户端残留行复活）', async () => {
       const ghost = 'session-ghost9999-0000-4000-8000-000000000099'
       archived.add(ghost)
       assert.ok(!headers.some((h) => h.id === ghost), 'ghost 不在磁盘清单')
       const r = res()
       await routes.get(`${P}/list`)(get(`${P}/list`), r)
       assert.equal(r.status, 200)
-      assert.ok(!archived.has(ghost), '/list 应清掉磁盘上不存在的归档 ghost')
-      const audit = await readFile(join(home, 'trash', 'sessions', 'audit.log'), 'utf8')
-      assert.ok(audit.includes('"action":"reconcile-archived-ghosts"'), '应写 reconcile 审计')
+      // 0.4.0 起 ghost 清理只在宿主重启（插件重新 apply）时进行：
+      // 运行期间摘除归档会广播 archived-sessions-changed，把已连接客户端
+      // list store 里的残留行重新显示回侧栏。
+      assert.ok(archived.has(ghost), '/list 不应在运行期间摘除归档 ghost')
     })
 
     await test('GET /preview 命中单个会话', async () => {
@@ -201,7 +202,8 @@ const P = '/api/session-delete'
       await routes.get(`${P}/delete`)(bodyReq('POST', `${P}/delete`, { id }), r)
       assert.equal(r.status, 200, JSON.stringify(r.body))
       assert.equal(archiveCalls.at(-1), id, '必须先调用 archiveSession')
-      assert.ok(!archived.has(id), '删除成功后应清掉 archivedSessionIds ghost')
+      assert.ok(archived.has(id), '删除后应保留归档隐藏（keptHidden），防止残留行复活')
+      assert.equal(r.body.keptHidden, true, '响应应报告 keptHidden')
       assert.ok(r.body.entry.startsWith('20'), r.body.entry)
       const entryDir = join(home, 'trash', 'sessions', r.body.entry)
       const meta = JSON.parse(await readFile(join(entryDir, 'meta.json'), 'utf8'))
@@ -213,7 +215,7 @@ const P = '/api/session-delete'
       assert.ok(!(await stat(dirBefore).then(() => true, () => false)), '原目录应消失')
       const audit = await readFile(join(home, 'trash', 'sessions', 'audit.log'), 'utf8')
       assert.ok(audit.includes(`"action":"delete"`) && audit.includes(id))
-      assert.ok(audit.includes('"forgottenArchived":true'), '审计应记录清理了归档 ghost')
+      assert.ok(audit.includes('"keptHidden":true'), '审计应记录保留了归档隐藏')
       // 磁盘清单不再包含该会话（桩的 list 模拟真实扫描）
       headers.splice(headers.findIndex((x) => x.id === id), 1)
     })
@@ -278,14 +280,12 @@ const P = '/api/session-delete'
       assert.equal(r2.status, 403)
     })
 
-    await test('POST /purge 单条彻底删除', async () => {
+    await test('POST /purge 单条彻底删除（归档 id 保留，运行期间不摘）', async () => {
       const id = 'session-aaaa2222-0000-4000-8000-000000000002'
       const rDel = res()
       await routes.get(`${P}/delete`)(bodyReq('POST', `${P}/delete`, { id }), rDel)
       assert.equal(rDel.status, 200)
-      assert.ok(!archived.has(id), 'delete 已清 ghost')
-      // 模拟旧数据：回收站条目仍在，但 archivedSessionIds 又被写回 ghost
-      archived.add(id)
+      assert.ok(archived.has(id), 'delete 保留归档隐藏')
       headers.splice(headers.findIndex((x) => x.id === id), 1)
       const r0 = res()
       await routes.get(`${P}/trash`)(get(`${P}/trash`), r0)
@@ -293,24 +293,23 @@ const P = '/api/session-delete'
       const r = res()
       await routes.get(`${P}/purge`)(bodyReq('POST', `${P}/purge`, { entry }), r)
       assert.equal(r.status, 200)
-      assert.ok(!archived.has(id), 'purge 单条也应清掉 archivedSessionIds ghost')
+      assert.ok(archived.has(id), 'purge 单条同样保留归档隐藏（运行期间不摘，防复活）')
       const r1 = res()
       await routes.get(`${P}/trash`)(get(`${P}/trash`), r1)
       assert.equal(r1.body.items.length, 0)
     })
 
-    await test('POST /purge all 清空回收站', async () => {
+    await test('POST /purge all 清空回收站（归档 id 保留）', async () => {
       const id = 'session-bbbb3333-0000-4000-8000-000000000003'
       const rDel = res()
       await routes.get(`${P}/delete`)(bodyReq('POST', `${P}/delete`, { id }), rDel)
       assert.equal(rDel.status, 200)
-      archived.add(id) // 模拟残留 ghost，验证 purge-all 批量清理
       headers.splice(headers.findIndex((x) => x.id === id), 1)
       const r = res()
       await routes.get(`${P}/purge`)(bodyReq('POST', `${P}/purge`, { all: true }), r)
       assert.equal(r.status, 200)
       assert.equal(r.body.count, 1)
-      assert.ok(!archived.has(id), 'purge-all 也应清掉 archivedSessionIds ghost')
+      assert.ok(archived.has(id), 'purge-all 同样保留归档隐藏')
       const left = await readdir(join(home, 'trash', 'sessions')).then((xs) => xs.filter((x) => x !== 'audit.log'))
       assert.equal(left.length, 0)
     })
@@ -347,7 +346,7 @@ const P = '/api/session-delete'
       assert.ok(!r.body.sessions.some((s) => s.id === LIVE_ID), '已删除会话不应出现在面板清单')
     })
 
-    await test('purge live 会话的回收站条目：保持归档；不再 live 后 reconcile 收敛', async () => {
+    await test('purge live 会话的回收站条目：保持归档；不再 live 后 /list 仍不摘', async () => {
       const rT = res()
       await routes.get(`${P}/trash`)(get(`${P}/trash`), rT)
       const entry = rT.body.items.find((i) => i.id === LIVE_ID)?.entry
@@ -356,12 +355,29 @@ const P = '/api/session-delete'
       await routes.get(`${P}/purge`)(bodyReq('POST', `${P}/purge`, { entry }), r)
       assert.equal(r.status, 200)
       assert.ok(archived.has(LIVE_ID), 'purge 后 live 会话仍应保持归档隐藏')
-      // 模拟宿主重启：会话不再 live → 下一次 /list 的 reconcile 清掉 ghost
+      // 会话不再 live（宿主侧 agent 消失）：/list 仍不应在运行期间摘除 ghost
       liveIdle.delete(LIVE_ID)
       const r2 = res()
       await routes.get(`${P}/list`)(get(`${P}/list`), r2)
       assert.equal(r2.status, 200)
-      assert.ok(!archived.has(LIVE_ID), '不再 live 后 reconcile 应清掉 ghost')
+      assert.ok(archived.has(LIVE_ID), '运行期间 /list 仍不应摘除 ghost')
+    })
+
+    await test('宿主重启（插件重新 apply）时 boot reconcile 清掉历史 ghost', async () => {
+      // 此刻 LIVE_ID 已 purge、不再 live，但仍留在 archived（运行期间有意保留）；
+      // 另有早前遗留的 ghost9999。模拟宿主重启：插件用同一存储重新 apply。
+      assert.ok(archived.has(LIVE_ID) && archived.has('session-ghost9999-0000-4000-8000-000000000099'))
+      const routes2 = new Map()
+      const ctx2 = { ...ctx, webServer: { register: (route) => routes2.set(route.path, route.handler) } }
+      apply(ctx2)
+      // boot reconcile 是 fire-and-forget：轮询等待其完成
+      for (let i = 0; i < 100 && (archived.has(LIVE_ID) || archived.has('session-ghost9999-0000-4000-8000-000000000099')); i += 1) {
+        await new Promise((r) => setTimeout(r, 20))
+      }
+      assert.ok(!archived.has(LIVE_ID), 'boot reconcile 应清掉已删会话的归档 ghost')
+      assert.ok(!archived.has('session-ghost9999-0000-4000-8000-000000000099'), 'boot reconcile 应清掉历史 ghost')
+      const audit = await readFile(join(home, 'trash', 'sessions', 'audit.log'), 'utf8')
+      assert.ok(audit.includes('"action":"reconcile-archived-ghosts"'), '应写 reconcile 审计')
     })
 
     await test('无缓存删除也能取标题（titlesFor 直读路径）', async () => {

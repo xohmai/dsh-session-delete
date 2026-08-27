@@ -117,6 +117,24 @@ window.__ModuleLoader__.load({
 
     // ---------- workspaces 客户端服务（apply 时注入） ----------
     let workspacesService = null
+    // 插件 client ctx（apply 时记录）：用于删除/还原后刷新宿主会话列表 store。
+    let clientCtx = null
+
+    /**
+     * 让操作方客户端的 list store 重拉 session.list 基线。
+     * 删除冷会话后宿主不发任何帧，本客户端 store 里的残留行只能靠基线重拉
+     * 剪掉（mergeOrderedBaseline 会移除基线中不存在的 id）——不刷新的话行虽
+     * 被归档隐藏，却仍留在内存里。refresh 不在 ISessions 类型化接口上（具体
+     * 类 SessionRuntime 的方法），故惰性解析 + 能力探测，失败静默。
+     */
+    function refreshClientSessionList() {
+      try {
+        const s = clientCtx?.sessions ?? clientCtx?.get?.('sessions')
+        s?.refresh?.()?.catch?.(() => {})
+      } catch {
+        /* 能力缺失时跳过：归档隐藏本身已保证已删会话不复活 */
+      }
+    }
 
     // ---------- 本机 API ----------
     async function api(path, options) {
@@ -134,22 +152,18 @@ window.__ModuleLoader__.load({
     }
 
     // ---------- 批量删除（返回统计与成功 id；命中当前会话时自动切走） ----------
-    // keptHidden：删除成功但仍处打开状态（live）的会话数——宿主内存里还有它，
-    // 服务端会保留归档隐藏防止侧栏复活，重启 DSH 后彻底消失（见 host 端说明）。
     async function deleteMany(ids, currentId, onProgress) {
       let ok = 0
       let failed = 0
-      let keptHidden = 0
       let message = null
       const okIds = []
       let deletedCurrent = false
       for (let i = 0; i < ids.length; i += 1) {
         const id = ids[i]
         try {
-          const r = await post(`${PREFIX}/delete`, { id })
+          await post(`${PREFIX}/delete`, { id })
           ok += 1
           okIds.push(id)
-          if (r?.keptHidden === true) keptHidden += 1
           if (id === currentId) deletedCurrent = true
         } catch (e) {
           failed += 1
@@ -162,7 +176,7 @@ window.__ModuleLoader__.load({
           workspacesService.startSession()
         } catch {}
       }
-      return { ok, failed, message, okIds, keptHidden }
+      return { ok, failed, message, okIds }
     }
 
     // ---------- 格式化 ----------
@@ -399,6 +413,7 @@ window.__ModuleLoader__.load({
           setList(list.filter((s) => !gone.has(s.id)))
         }
         loadTrash() // 1ms 级接口；trash 从 null→有值 后「回收站 (N)」徽标立即出现/更新
+        refreshClientSessionList() // 剪掉本客户端 list store 里的残留行
       }
       /** 在线解除归档成功后本地把对应行标记为未归档：离开归档页签、徽标即时递减。 */
       function markUnarchivedLocally(okIds) {
@@ -421,9 +436,7 @@ window.__ModuleLoader__.load({
             setNotice({
               kind: 'ok',
               title: `已删除「${title || shortId(id)}」`,
-              detail:
-                `已移入回收站（${fmtSize(freedOf(r.okIds))}）· 可在「回收站」页签还原` +
-                (r.keptHidden > 0 ? '；该会话处于打开状态，已对其保持隐藏，重启 DSH 后彻底消失' : ''),
+              detail: `已移入回收站（${fmtSize(freedOf(r.okIds))}）· 侧栏已隐藏 · 可在「回收站」页签还原`,
               at: at(),
             })
           } else {
@@ -445,9 +458,7 @@ window.__ModuleLoader__.load({
             setNotice({
               kind: 'ok',
               title: `已删除 ${r.ok} 个会话 · 释放 ${fmtSize(freedOf(r.okIds))}`,
-              detail:
-                '已移入回收站 · 可在「回收站」页签还原' +
-                (r.keptHidden > 0 ? `；其中 ${r.keptHidden} 个处于打开状态，已保持隐藏，重启 DSH 后彻底消失` : ''),
+              detail: '已移入回收站 · 侧栏已隐藏 · 可在「回收站」页签还原',
               at: at(),
             })
           } else if (r.ok > 0) {
@@ -546,6 +557,7 @@ window.__ModuleLoader__.load({
           setBusy(false)
           await loadTrash()
           loadList() // 还原的会话回到清单（归档页签/全部页签与徽标同步）
+          refreshClientSessionList() // 拉最新基线，让还原的会话行数据与磁盘一致
         }
       }
       async function firePurge(entry) {
@@ -611,6 +623,7 @@ window.__ModuleLoader__.load({
           setSelected(new Set())
           await loadTrash()
           loadList()
+          refreshClientSessionList()
         }
       }
       /** 批量彻底删除所选条目（两步确认后进入）。 */
@@ -792,9 +805,7 @@ window.__ModuleLoader__.load({
                     onArm: () => setArm(s.id),
                     onFire: () => fireSingleDelete(s.id),
                     busy,
-                    hint: s.live
-                      ? '该会话处于打开状态：删除后文件进回收站，会话保持隐藏，重启 DSH 后彻底消失'
-                      : '删除后移入回收站，可在「回收站」页签还原',
+                    hint: '删除后移入回收站并保持侧栏隐藏，可在「回收站」页签还原',
                   }),
                 )
               : null,
@@ -1063,10 +1074,8 @@ window.__ModuleLoader__.load({
                 unarchiveSupported
                   ? '点击行内「还原」或勾选后批量还原：会话立即回到侧栏原分组，无需重启。'
                   : '当前 DSH 版本不支持在线解除归档；如需找回，见 README 的 unhide 步骤。'),
-              archivedSessions.some((s) => s.live)
-                ? h('div', { key: 'c', style: { fontSize: 11, color: T.warn, lineHeight: '17px', marginTop: 2 } },
-                    '「打开中」的会话仍驻留在宿主内存：删除后文件进回收站、会话保持隐藏，重启 DSH 后彻底消失。')
-                : null,
+              h('div', { key: 'c', style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary, var(--dsw-alias-label-secondary))', lineHeight: '17px', marginTop: 2 } },
+                '删除后会话保持归档隐藏，不会回到侧栏；归档标记在下次重启 DSH 时彻底清理，回收站还原则立即恢复显示。'),
             ],
           )
         }
@@ -1190,6 +1199,7 @@ window.__ModuleLoader__.load({
     // ---------- 注册 ----------
     function apply(ctx) {
       workspacesService = ctx.workspaces
+      clientCtx = ctx
       ctx.effect(() => {
         const el = document.createElement('style')
         el.id = 'dsh-session-delete-styles'

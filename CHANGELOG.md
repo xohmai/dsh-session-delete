@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.0
+
+- Fix (complete): deleted sessions no longer reappear in the workspace sidebar, in any client. Root cause beyond 0.3.0's live-session case: client sidebars render rows from an in-memory list store that only prunes on `host/session-removed` (live disposals only) or a fresh `session.list` baseline — forgetting a deleted cold session's archive id broadcast `archived-sessions-changed` and resurrected the stale row in every connected client
+- Delete / purge / purge-all now always keep the archive-set entry during runtime (`keptHidden`); a ghost id without a list row renders nothing in the official UI, so keeping it is free. Ghosts are reconciled once at Host restart (plugin mount), when every client rebuilds from a fresh baseline and un-archiving can resurrect nothing
+- `/list` no longer reconciles ghosts during runtime (that broadcast was itself a resurrection trigger for long-lived clients)
+- The acting client now pulls a fresh `session.list` baseline after deletes and restores (`sessions.refresh()`, capability-detected), pruning its own stale rows immediately
+
 ## 0.3.0
 
 - Fix: deleting an archived session that is still attached in memory ("打开中") no longer makes it reappear in the workspace sidebar — the Host serves live sessions from memory regardless of disk state, so the archive-set entry is now deliberately kept (`keptHidden`) to hold the session hidden; the leftover id is reconciled automatically once the session is no longer live (e.g. after a Host restart)

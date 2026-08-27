@@ -6,11 +6,11 @@
  * 预检，而本服务不答 CORS 预检）：
  *   GET  /api/session-delete/list           全量会话清单（清理面板数据源）
  *   GET  /api/session-delete/preview?id=    单会话删除预览
- *   POST /api/session-delete/delete         { id } 归档 + 移入回收站 + 清归档 ghost
+ *   POST /api/session-delete/delete         { id } 归档 + 移入回收站（保留归档隐藏）
  *   GET  /api/session-delete/trash          回收站清单
  *   POST /api/session-delete/restore        { entry } 原位还原 + 自动解除归档
  *   POST /api/session-delete/unarchive      { id } 在线解除归档（旧版回退 501）
- *   POST /api/session-delete/purge          { entry? , all? } 彻底删除 + 清归档 ghost
+ *   POST /api/session-delete/purge          { entry? , all? } 彻底删除（保留归档隐藏）
  *
  * 删除流水线（顺序不可换）：
  *   1. 运行保护：agents.get(id) 存在且 status !== 'idle' → 拒绝
@@ -19,16 +19,21 @@
  *      广播 host/archived-sessions-changed，侧栏即时隐藏；
  *   3. sessionPersistence.locate(header) 定位真实磁盘目录（不硬编码路径）；
  *   4. rename 移入 <DSH_HOME>/trash/sessions/<时间戳>-<id>/data/（回收站）；
- *   5. 归档 ghost 收尾（见 forgetArchivedSessions），但只对「非 live」会话摘除：
- *      宿主 session.list 无条件吐出 attach 在内存里的活会话（仅靠归档集在
- *      分组视图中隐藏）。若对活会话摘掉归档，archived-sessions-changed 广播
- *      会立刻让它在侧栏复活——文件却已进回收站（"删除后又回到工作区"）。
- *      活会话因此保持归档隐藏（keptHidden），待宿主重启不再 live 后由 /list
- *      的 reconcile 清掉这条 ghost；非 live 会话则立即摘除，不留 ghost。
- *      活会话后续的 flush 会因父目录已移走而 ENOENT 失败（append 用 open("a")
- *      但目录不存在），不会在磁盘上重建会话——复活只可能来自内存态，已被
- *      归档隐藏压住。DSH 没有公开的他人 agent 卸载 API（dispose 闭包私有于
- *      agent-loop 工厂），所以「保持隐藏 + 重启收敛」是正确且唯一的取舍。
+ *   5. 归档 id 保留（keptHidden），运行期间永不摘除：
+ *      客户端侧栏的行来自内存 list store——只有 host/session-removed 帧
+ *      （仅 live 会话 dispose 时宿主才发）或全新的 session.list 基线才能把
+ *      行移除；冷会话被删后宿主不发任何帧，行一直留在已连接客户端的 store
+ *      里。此时若把 id 摘出归档集，archived-sessions-changed 广播会把这条
+ *      残留行重新显示回侧栏（"删除后又回到工作区"）；live 会话同理（宿主
+ *      session.list 无条件从内存吐活会话，DSH 也没有公开的他人 agent 卸载
+ *      API——dispose 闭包私有于 agent-loop 工厂）。归档集只是隐藏标记：
+ *      没有行的 ghost id 在官方 UI 里不渲染任何东西，保留代价为零。
+ *      ghost 的最终清理由「宿主重启时的 reconcile」完成（见 apply 尾部）：
+ *      重启后所有客户端都用全新基线重建 store，已删会话的行不复存在，此时
+ *      摘除归档 id 不可能复活任何东西。操作方客户端删除后还会主动调
+ *      sessions.refresh() 剪掉自己 store 里的残留行（见 client 半）。
+ *      live 会话后续的 flush 会因父目录已移走而 ENOENT 失败（append 用
+ *      open("a") 但目录不存在），不会在磁盘上重建会话。
  *
  * 审计：<DSH_HOME>/trash/sessions/audit.log（JSONL 追加）。
  *
@@ -38,7 +43,8 @@
  *     domain/changed(workspace)，宿主 apiproxy 检测到归档集变化后自动广播
  *     host/archived-sessions-changed，侧栏即时恢复——与归档传播完全对称。
  *     能力探测失败（未来版本内部变更）时：/unarchive 回退 501 UNSUPPORTED；
- *     删除/清空路径的 ghost 清理改为静默跳过（旧版无法改 archivedSessionIds）。
+ *     重启 reconcile 同样静默跳过（旧版无法改 archivedSessionIds，ghost
+ *     只能由 tools/unhide.mjs 离线清理）。
  *   - 投影缓存 session_projcache.json 中可能残留死条目（无害，重启自愈）。
  *   - 搜索索引（sqlite）按磁盘清单 reconcile，文件消失后自动清行。
  */
@@ -249,10 +255,12 @@ export function apply(ctx) {
 
   /**
    * 清掉「归档集里有、磁盘清单里没有」的历史 ghost。
-   * 覆盖升级前留下的残留；/list 时 best-effort 触发一次即可。
-   * live 会话除外：它的「ghost」是删除流水线有意保留的隐藏态（宿主还在
-   * 内存里吐这条会话，摘掉归档会让它在侧栏复活）——等宿主重启不再 live，
-   * 下一轮 reconcile 自然清掉。
+   * 只在宿主重启（插件重新挂载）时调用：此刻所有客户端都会用全新基线重建
+   * list store，已删会话的行不复存在，摘除归档 id 不会复活任何东西。
+   * 运行期间绝不调用——长连客户端的 store 可能还持有已删会话的残留行，
+   * 摘除归档会把它们显示回侧栏。
+   * live 会话除外（boot 时配置启动的 agent 已 resume，但它们都在盘上，
+   * 不会命中 ghost 条件；保留检查作纵深防御）。
    */
   async function reconcileArchivedGhosts() {
     if (!registryCanUnarchive()) return 0
@@ -392,11 +400,8 @@ export function apply(ctx) {
     const dir = dirname(location.path)
     if ((await stat(dir).catch(() => undefined)) === undefined) {
       // 目录已不存在（例如此前删了一半）：归档已完成，直接视为成功。
-      // live 会话同样保留归档隐藏（见文件头删除流水线第 5 步）。
-      const live = agentState(id).live
-      const forgotten = live ? 0 : await forgetArchivedSessions([id])
       const keptHidden = archivedSet().has(id)
-      await audit('delete', { id, note: 'dir-missing', live, forgottenArchived: forgotten > 0, keptHidden })
+      await audit('delete', { id, note: 'dir-missing', keptHidden })
       return { id, ok: true, note: 'dir-missing', keptHidden }
     }
     const sizeBytes = await dirSize(dir)
@@ -437,15 +442,12 @@ export function apply(ctx) {
         2,
       ),
     )
-    // 文件已离盘。归档 ghost 收尾对 live 会话网开一面（见文件头删除流水线
-    // 第 5 步）：活会话摘掉归档会立即在侧栏复活，因此保持隐藏；非 live 会话
-    // 立即摘除，不留 ghost。旧版无状态机时 forget 静默跳过，keptHidden 同样
-    // 为 true——由 /list 的 reconcile 兜底（旧版 reconcile 因能力缺失不工作，
-    // 只能等新版或离线 unhide）。
-    const live = agentState(id).live
-    const forgotten = live ? 0 : await forgetArchivedSessions([id])
+    // 文件已离盘。归档 id 保留不摘（见文件头删除流水线第 5 步）：摘除会广播
+    // archived-sessions-changed，把已连接客户端 list store 里的残留行（冷会话）
+    // 或宿主内存里的活会话（live）重新显示回侧栏。ghost 待宿主重启时由
+    // reconcileArchivedGhosts 统一清理。
     const keptHidden = archivedSet().has(id)
-    await audit('delete', { id, entry, live, forgottenArchived: forgotten > 0, keptHidden })
+    await audit('delete', { id, entry, keptHidden })
     recordCache.delete(id)
     return { id, ok: true, entry, keptHidden }
   }
@@ -551,12 +553,10 @@ export function apply(ctx) {
     const root = await trashRoot()
     if (all) {
       const items = await listTrash()
-      const ids = items.map((item) => item.id).filter((id) => typeof id === 'string' && id)
       for (const item of items) await rm(join(root, item.entry), { recursive: true, force: true })
-      // live 会话的归档 id 不能摘（同 delete）：摘掉会让仍在内存里的会话
-      // 立刻在侧栏复活，而文件已被彻底删除。保持隐藏，重启后由 reconcile 收敛。
-      const forgotten = await forgetArchivedSessions(ids.filter((id) => !agentState(id).live))
-      await audit('purge-all', { count: items.length, forgottenArchived: forgotten })
+      // 归档 id 保留不摘（同 delete，见文件头第 5 步）：运行期间摘除会复活
+      // 客户端残留行 / 宿主活会话；ghost 由宿主重启时的 reconcile 统一清理。
+      await audit('purge-all', { count: items.length })
       return { ok: true, count: items.length }
     }
     const entryDir = await resolveTrashEntryDir(entry)
@@ -565,12 +565,11 @@ export function apply(ctx) {
       const meta = JSON.parse(await readFile(join(entryDir, 'meta.json'), 'utf8'))
       if (typeof meta?.id === 'string' && ID_RE.test(meta.id)) metaId = meta.id
     } catch {
-      /* meta 缺失/损坏时仍允许清空目录；只是无法定向清理归档 ghost */
+      /* meta 缺失/损坏时仍允许清空目录 */
     }
     await rm(entryDir, { recursive: true, force: true })
-    // live 会话保留归档隐藏（同 delete / purge-all）
-    const forgotten = metaId && !agentState(metaId).live ? await forgetArchivedSessions([metaId]) : 0
-    await audit('purge', { entry, id: metaId, forgottenArchived: forgotten > 0 })
+    // 归档 id 保留不摘（同 delete / purge-all）
+    await audit('purge', { entry, id: metaId })
     return { ok: true, count: 1 }
   }
 
@@ -624,8 +623,7 @@ export function apply(ctx) {
       path: `${PREFIX}/list`,
       handler: guard(async (req, res) => {
         if (req.method !== 'GET') return sendJson(res, 405, { error: { code: 'METHOD', message: 'GET only' } })
-        // 先 reconcile 历史 ghost，再读 sessions：archived 标记与官方计数一致。
-        await reconcileArchivedGhosts()
+        // 运行期间不做 ghost reconcile（见 reconcileArchivedGhosts 注释）。
         const [sessions, workspaces] = await Promise.all([
           sessionRecords(),
           Promise.resolve()
@@ -733,4 +731,11 @@ export function apply(ctx) {
       }),
     }),
   )
+
+  // 宿主重启时 reconcile 一次历史归档 ghost（fire-and-forget）。
+  // 此刻所有客户端都将以全新基线重建 list store，已删会话的行不复存在，
+  // 摘除归档 id 是安全的；运行期间则绝不摘除（详见 reconcileArchivedGhosts）。
+  // inject 保证 workspaceRegistry/sessionPersistence 在 apply 前完成 init，
+  // requireState 此处不会抛 "not started yet"。
+  reconcileArchivedGhosts().catch(() => {})
 }
