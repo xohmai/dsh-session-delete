@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.0
+
+- Fix: deleting an archived session that is still attached in memory ("打开中") no longer makes it reappear in the workspace sidebar — the Host serves live sessions from memory regardless of disk state, so the archive-set entry is now deliberately kept (`keptHidden`) to hold the session hidden; the leftover id is reconciled automatically once the session is no longer live (e.g. after a Host restart)
+- The same live-aware keep-hidden rule now applies to trash purge / purge-all and to the `/list` ghost reconcile (which no longer strips archive entries belonging to live sessions)
+- Delete responses carry `keptHidden`; the UI notice explains when a deleted session stays hidden until restart
+- UI: batch "删除所选" now uses the same two-step arm-and-confirm as single delete and trash purge (auto-disarms on selection change / tab switch); delete buttons carry explanatory tooltips; the Archived tab shows a contextual hint when live sessions are present
+
 ## 0.2.3
 
 - Reconcile historical `archivedSessionIds` ghosts on `/list`: ids present in `workspace.json` but missing from the on-disk session inventory are removed best-effort

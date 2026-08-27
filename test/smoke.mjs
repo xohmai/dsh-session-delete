@@ -3,7 +3,8 @@
  *
  * 用桩 ctx 直接驱动 apply() 注册的 HTTP 路由，在临时目录里模拟真实存储布局：
  *   <home>/sessions/<slug>/session-<id>/session.jsonl.zstd
- * 验证：list / preview / delete（含运行保护、归档时序）/ trash / restore / purge / CSRF。
+ * 验证：list / preview / delete（含运行保护、归档时序、live 会话保持隐藏）/
+ * trash / restore / purge / CSRF。
  *
  * 运行：node test/smoke.mjs
  */
@@ -23,6 +24,7 @@ const headers = []
 const archived = new Set()
 const archiveCalls = []
 const running = new Map() // id -> true 表示运行中
+const liveIdle = new Set() // id -> attach 在内存里但空闲（「打开中」）
 
 function slug(cwd) {
   return `--${cwd.replace(/\//g, '-').slice(1)}--`
@@ -65,7 +67,7 @@ const ctx = {
     },
   },
   agents: {
-    get: (id) => (running.get(id) ? { status: 'running' } : undefined),
+    get: (id) => (running.get(id) ? { status: 'running' } : liveIdle.has(id) ? { status: 'idle' } : undefined),
   },
   // 模拟真实 sessionQuery：readTitleSnapshots 返回的 title 是 SessionTitleSnapshot
   // 对象（含 title/messageSeqs/source/eventSeq/updatedAt），不是字符串。
@@ -311,6 +313,55 @@ const P = '/api/session-delete'
       assert.ok(!archived.has(id), 'purge-all 也应清掉 archivedSessionIds ghost')
       const left = await readdir(join(home, 'trash', 'sessions')).then((xs) => xs.filter((x) => x !== 'audit.log'))
       assert.equal(left.length, 0)
+    })
+
+    // --- live（打开中）会话：删除后保持归档隐藏，防止侧栏复活（0.3.0 修复） ---
+    // 宿主 session.list 无条件吐出 attach 在内存里的活会话；若删除时摘掉归档，
+    // archived-sessions-changed 广播会让它立刻在侧栏复活（文件却已进回收站）。
+    const LIVE_ID = 'session-live1111-0000-4000-8000-000000000010'
+
+    await test('删除「打开中」会话：文件进回收站，但保持归档隐藏（keptHidden）', async () => {
+      await createSession(LIVE_ID, cwdA, 64)
+      liveIdle.add(LIVE_ID)
+      const r = res()
+      await routes.get(`${P}/delete`)(bodyReq('POST', `${P}/delete`, { id: LIVE_ID }), r)
+      assert.equal(r.status, 200, JSON.stringify(r.body))
+      assert.equal(r.body.keptHidden, true, 'live 会话删除后应报告 keptHidden')
+      assert.ok(archived.has(LIVE_ID), 'live 会话应保持归档隐藏（摘掉会在侧栏复活）')
+      assert.ok(r.body.entry, '应返回回收站条目')
+      assert.ok(
+        await stat(join(home, 'trash', 'sessions', r.body.entry, 'data', 'session.jsonl.zstd')).then(() => true, () => false),
+        '文件应移入回收站',
+      )
+      const audit = await readFile(join(home, 'trash', 'sessions', 'audit.log'), 'utf8')
+      assert.ok(audit.includes('"keptHidden":true'), '审计应记录 keptHidden')
+      headers.splice(headers.findIndex((x) => x.id === LIVE_ID), 1) // 模拟真实磁盘扫描
+    })
+
+    await test('/list reconcile 跳过 live 会话的归档 id（有意保留的隐藏态）', async () => {
+      assert.ok(archived.has(LIVE_ID) && liveIdle.has(LIVE_ID))
+      const r = res()
+      await routes.get(`${P}/list`)(get(`${P}/list`), r)
+      assert.equal(r.status, 200)
+      assert.ok(archived.has(LIVE_ID), 'live ghost 不应被 reconcile 清掉（清掉会在侧栏复活）')
+      assert.ok(!r.body.sessions.some((s) => s.id === LIVE_ID), '已删除会话不应出现在面板清单')
+    })
+
+    await test('purge live 会话的回收站条目：保持归档；不再 live 后 reconcile 收敛', async () => {
+      const rT = res()
+      await routes.get(`${P}/trash`)(get(`${P}/trash`), rT)
+      const entry = rT.body.items.find((i) => i.id === LIVE_ID)?.entry
+      assert.ok(entry, '回收站应有该会话的条目')
+      const r = res()
+      await routes.get(`${P}/purge`)(bodyReq('POST', `${P}/purge`, { entry }), r)
+      assert.equal(r.status, 200)
+      assert.ok(archived.has(LIVE_ID), 'purge 后 live 会话仍应保持归档隐藏')
+      // 模拟宿主重启：会话不再 live → 下一次 /list 的 reconcile 清掉 ghost
+      liveIdle.delete(LIVE_ID)
+      const r2 = res()
+      await routes.get(`${P}/list`)(get(`${P}/list`), r2)
+      assert.equal(r2.status, 200)
+      assert.ok(!archived.has(LIVE_ID), '不再 live 后 reconcile 应清掉 ghost')
     })
 
     await test('无缓存删除也能取标题（titlesFor 直读路径）', async () => {

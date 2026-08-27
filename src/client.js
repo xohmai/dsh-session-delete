@@ -134,18 +134,22 @@ window.__ModuleLoader__.load({
     }
 
     // ---------- 批量删除（返回统计与成功 id；命中当前会话时自动切走） ----------
+    // keptHidden：删除成功但仍处打开状态（live）的会话数——宿主内存里还有它，
+    // 服务端会保留归档隐藏防止侧栏复活，重启 DSH 后彻底消失（见 host 端说明）。
     async function deleteMany(ids, currentId, onProgress) {
       let ok = 0
       let failed = 0
+      let keptHidden = 0
       let message = null
       const okIds = []
       let deletedCurrent = false
       for (let i = 0; i < ids.length; i += 1) {
         const id = ids[i]
         try {
-          await post(`${PREFIX}/delete`, { id })
+          const r = await post(`${PREFIX}/delete`, { id })
           ok += 1
           okIds.push(id)
+          if (r?.keptHidden === true) keptHidden += 1
           if (id === currentId) deletedCurrent = true
         } catch (e) {
           failed += 1
@@ -158,7 +162,7 @@ window.__ModuleLoader__.load({
           workspacesService.startSession()
         } catch {}
       }
-      return { ok, failed, message, okIds }
+      return { ok, failed, message, okIds, keptHidden }
     }
 
     // ---------- 格式化 ----------
@@ -279,7 +283,7 @@ window.__ModuleLoader__.load({
     }
 
     /** 单条两步确认删除按钮：第一次点击武装（变红），4 秒内再点执行。 */
-    function ArmDeleteButton({ armed, onArm, onFire, busy, label = '删除' }) {
+    function ArmDeleteButton({ armed, onArm, onFire, busy, label = '删除', hint }) {
       return h(
         'button',
         {
@@ -292,6 +296,7 @@ window.__ModuleLoader__.load({
             fontWeight: armed ? 600 : 400,
           },
           disabled: busy,
+          title: hint,
           onClick: armed ? onFire : onArm,
         },
         armed ? '确认删除' : label,
@@ -416,7 +421,9 @@ window.__ModuleLoader__.load({
             setNotice({
               kind: 'ok',
               title: `已删除「${title || shortId(id)}」`,
-              detail: `已移入回收站（${fmtSize(freedOf(r.okIds))}）· 可在「回收站」页签还原`,
+              detail:
+                `已移入回收站（${fmtSize(freedOf(r.okIds))}）· 可在「回收站」页签还原` +
+                (r.keptHidden > 0 ? '；该会话处于打开状态，已对其保持隐藏，重启 DSH 后彻底消失' : ''),
               at: at(),
             })
           } else {
@@ -429,6 +436,7 @@ window.__ModuleLoader__.load({
         }
       }
       async function fireBatchDelete(ids) {
+        setArm(null)
         setBusy(true)
         setProgress({ done: 0, total: ids.length })
         try {
@@ -437,7 +445,9 @@ window.__ModuleLoader__.load({
             setNotice({
               kind: 'ok',
               title: `已删除 ${r.ok} 个会话 · 释放 ${fmtSize(freedOf(r.okIds))}`,
-              detail: '已移入回收站 · 可在「回收站」页签还原',
+              detail:
+                '已移入回收站 · 可在「回收站」页签还原' +
+                (r.keptHidden > 0 ? `；其中 ${r.keptHidden} 个处于打开状态，已保持隐藏，重启 DSH 后彻底消失` : ''),
               at: at(),
             })
           } else if (r.ok > 0) {
@@ -652,8 +662,8 @@ window.__ModuleLoader__.load({
       })
 
       const toggle = (id) => {
-        // 批量彻底删除处于武装态时改选集会让按钮计数失真——直接解除武装
-        if (arm === 'trash-sel') setArm(null)
+        // 批量删除/彻底删除处于武装态时改选集会让按钮计数失真——直接解除武装
+        if (arm === 'trash-sel' || arm === 'sel:del') setArm(null)
         setSelected((prev) => {
           const next = new Set(prev)
           if (next.has(id)) next.delete(id)
@@ -662,6 +672,7 @@ window.__ModuleLoader__.load({
         })
       }
       const toggleGroup = (groupSessions) => {
+        if (arm === 'sel:del') setArm(null)
         setSelected((prev) => {
           const next = new Set(prev)
           const allIn = groupSessions.every((s) => next.has(s.id))
@@ -781,6 +792,9 @@ window.__ModuleLoader__.load({
                     onArm: () => setArm(s.id),
                     onFire: () => fireSingleDelete(s.id),
                     busy,
+                    hint: s.live
+                      ? '该会话处于打开状态：删除后文件进回收站，会话保持隐藏，重启 DSH 后彻底消失'
+                      : '删除后移入回收站，可在「回收站」页签还原',
                   }),
                 )
               : null,
@@ -971,6 +985,9 @@ window.__ModuleLoader__.load({
         const allSelected = rows.every((s) => selected.has(s.id))
         const toggleSelectAll = () => setSelected(allSelected ? new Set() : new Set(rows.map((s) => s.id)))
         const showRestore = tab === 'archived' && unarchiveSupported
+        // 批量删除与行内单删/回收站清空同款两步确认：第一次点击武装（4 秒有效），
+        // 再点执行——误触不会一次删掉整组会话。改选集/切页签会自动解除武装。
+        const batchDelArmed = arm === 'sel:del'
         return h('div', { style: { borderTop: `1px solid ${T.border}`, paddingTop: 8, marginTop: 8, flex: 'none' } }, [
           h('div', { key: 'b', style: { display: 'flex', alignItems: 'center', gap: 8 } }, [
             h('span', { key: 'n', style: { fontSize: 12, color: T.secondary } }, busy ? `${progress?.label ?? '删除中'} ${progress?.done ?? 0}/${progress?.total ?? 0}` : `已选 ${selected.size} 项 · ${fmtSize(selectedBytes(rows))}`),
@@ -1003,10 +1020,11 @@ window.__ModuleLoader__.load({
                 className: 'sd-btn',
                 style: { ...smallBtn, marginLeft: showRestore ? 0 : 'auto', background: selected.size > 0 ? T.err : 'transparent', borderColor: selected.size > 0 ? T.err : T.border, color: selected.size > 0 ? '#fff' : T.label, fontWeight: 600 },
                 disabled: busy || selected.size === 0,
-                onClick: () => fireBatchDelete([...selected]),
+                title: '删除后移入回收站，可在「回收站」页签还原',
+                onClick: () => (batchDelArmed ? fireBatchDelete([...selected]) : setArm('sel:del')),
               },
               busy ? h('span', { className: 'sd-spin' }, '↻') : null,
-              `删除所选 (${selected.size})`,
+              batchDelArmed ? `确认删除 (${selected.size})` : `删除所选 (${selected.size})`,
             ),
           ]),
         ])
@@ -1018,7 +1036,7 @@ window.__ModuleLoader__.load({
           const filterBtn = (id, label) =>
             h(
               'button',
-              { key: id, className: 'sd-btn', style: { ...smallBtn, borderColor: filter === id ? T.brand : T.border, color: filter === id ? T.brand : T.secondary, fontWeight: filter === id ? 600 : 400 }, onClick: () => { setFilter(id); setSelected(new Set()) } },
+              { key: id, className: 'sd-btn', style: { ...smallBtn, borderColor: filter === id ? T.brand : T.border, color: filter === id ? T.brand : T.secondary, fontWeight: filter === id ? 600 : 400 }, onClick: () => { setFilter(id); setSelected(new Set()); setArm(null) } },
               label,
             )
           return h(
@@ -1045,6 +1063,10 @@ window.__ModuleLoader__.load({
                 unarchiveSupported
                   ? '点击行内「还原」或勾选后批量还原：会话立即回到侧栏原分组，无需重启。'
                   : '当前 DSH 版本不支持在线解除归档；如需找回，见 README 的 unhide 步骤。'),
+              archivedSessions.some((s) => s.live)
+                ? h('div', { key: 'c', style: { fontSize: 11, color: T.warn, lineHeight: '17px', marginTop: 2 } },
+                    '「打开中」的会话仍驻留在宿主内存：删除后文件进回收站、会话保持隐藏，重启 DSH 后彻底消失。')
+                : null,
             ],
           )
         }

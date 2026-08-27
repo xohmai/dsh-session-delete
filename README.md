@@ -23,8 +23,8 @@ dsh plugin --profile web add github:xohmai/dsh-session-delete
 **方式二：tarball 离线分发（内网场景）**
 
 ```sh
-npm pack                                               # 产出 dsh-session-delete-0.2.3.tgz
-dsh plugin --profile web add ./dsh-session-delete-0.2.3.tgz
+npm pack                                               # 产出 dsh-session-delete-0.3.0.tgz
+dsh plugin --profile web add ./dsh-session-delete-0.3.0.tgz
 ```
 
 ## 使用
@@ -33,6 +33,7 @@ dsh plugin --profile web add ./dsh-session-delete-0.2.3.tgz
 2. 在侧栏右键归档的会话出现在「归档会话」页签：行内「还原」解除归档（侧栏原分组立即可见），或删除；「全部会话」页签可处理任意会话
 3. 删除先入回收站（`~/.dsh/trash/sessions/`），「还原」时文件归位并自动解除归档；确定不要再「彻底删除」
 4. 删除 / 清空时会尽量同步清掉 `workspace.json` 里的 `archivedSessionIds` ghost；打开设置页拉清单时也会 reconcile 历史残留，避免官方归档计数虚高
+5. **「打开中」的会话**：宿主把已打开的会话缓存在内存里，删除后若立即解除归档，它会重新出现在侧栏——因此这类会话删除后保持归档隐藏（侧栏不可见），重启 DSH 后彻底消失；回收站还原则不受此限制，随时可完整找回
 
 **旧版 DSH 回退**：在线解除归档走 workspaceRegistry 内部状态机，插件启动时自动探测能力；不可用时隐藏还原入口，可在 DSH 停止时运行 `node tools/unhide.mjs <sessionId>` 离线找回。旧版同样无法在线清理删除留下的归档 ghost。
 
