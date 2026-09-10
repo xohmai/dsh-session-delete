@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.1
+
+- Fix (compat): DSH 0.1.5 changed `sessionPersistence.list()` to return `{ header, revision, sizeBytes }` snapshots instead of bare header arrays; the wrapper flowed into `locate()` and crashed every `/api/session-delete/list` and `/trash` request with "Cannot read properties of undefined (reading 'length')" (inside `encodeSegment(undefined)`). Both call sites now unwrap snapshots via a compat helper (`item.header ?? item`, same unwrap the official session-query uses), so both the new and the legacy (≤0.1.1-rc.x) shapes work
+- Dev: `react`/`react-dom` 18.3.1 as devDependencies — DSH 0.1.5 no longer ships react in its node_modules, so the render smoke tests resolve it from the plugin's own dev install
+- Tests: smoke stub now models the 0.1.5+ snapshot shape by default; a dedicated test keeps the legacy bare-header shape covered
+
 ## 0.4.0
 
 - Fix (complete): deleted sessions no longer reappear in the workspace sidebar, in any client. Root cause beyond 0.3.0's live-session case: client sidebars render rows from an in-memory list store that only prunes on `host/session-removed` (live disposals only) or a fresh `session.list` baseline — forgetting a deleted cold session's archive id broadcast `archived-sessions-changed` and resurrected the stale row in every connected client

@@ -23,8 +23,8 @@ dsh plugin --profile web add github:xohmai/dsh-session-delete
 **方式二：tarball 离线分发（内网场景）**
 
 ```sh
-npm pack                                               # 产出 dsh-session-delete-0.4.0.tgz
-dsh plugin --profile web add ./dsh-session-delete-0.4.0.tgz
+npm pack                                               # 产出 dsh-session-delete-0.4.1.tgz
+dsh plugin --profile web add ./dsh-session-delete-0.4.1.tgz
 ```
 
 ## 使用
@@ -36,6 +36,8 @@ dsh plugin --profile web add ./dsh-session-delete-0.4.0.tgz
 5. 回收站还原不受此限制：文件归位 + 自动解除归档，会话立即回到侧栏原分组
 
 **旧版 DSH 回退**：在线解除归档走 workspaceRegistry 内部状态机，插件启动时自动探测能力；不可用时隐藏还原入口，可在 DSH 停止时运行 `node tools/unhide.mjs <sessionId>` 离线找回。旧版同样无法在重启时清理归档 ghost（能力缺失时 reconcile 静默跳过）。
+
+**兼容性**：同时支持新版（0.1.5+，`sessionPersistence.list()` 返回 `{header, revision, sizeBytes}` 快照）与旧版（≤0.1.1-rc.x，直接返回 header 数组）两代持久化接口——v0.4.0 在 DSH 0.1.5 上 `/list`、`/trash` 全部 500（"reading 'length'"）的问题已在 v0.4.1 修复。
 
 ## 开发
 

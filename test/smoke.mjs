@@ -43,9 +43,15 @@ async function createSession(id, cwd, bytes = 128) {
 }
 
 const routes = new Map()
+// 默认模拟 DSH 0.1.5+ 的 list() 返回形状：{ header, revision, sizeBytes } 快照数组
+// （旧版 ≤0.1.1-rc.x 直接返回 header 数组；legacyListShape 测试单独覆盖旧形状）。
+let legacyListShape = false
 const ctx = {
   sessionPersistence: {
-    list: async () => headers.slice(),
+    list: async () => {
+      const items = headers.slice()
+      return legacyListShape ? items : items.map((header) => ({ header, revision: `mtime:${items.indexOf(header)}:1`, sizeBytes: 128 }))
+    },
     locate,
   },
   workspaceRegistry: {
@@ -157,6 +163,24 @@ const P = '/api/session-delete'
       const a1b = r2.body.sessions.find((s) => s.id.endsWith('0001'))
       assert.strictEqual(a1b.title, a1.title, '缓存命中的 title 应与首次一致')
       assert.strictEqual(a1b.sizeBytes, a1.sizeBytes)
+    })
+
+    await test('旧版 DSH（≤0.1.1-rc.x）list() 直接返回 header 数组也能工作', async () => {
+      // v0.4.1 兼容两代返回形状：0.1.5+ 返回 { header, ... } 快照数组，
+      // 旧版直接返回 header。不解包新形状会让 wrapper 流进 locate()，
+      // 在 encodeSegment(undefined) 上抛 "reading 'length'"。
+      legacyListShape = true
+      try {
+        const r = res()
+        await routes.get(`${P}/list`)(get(`${P}/list`), r)
+        assert.equal(r.status, 200)
+        assert.equal(r.body.sessions.length, 3)
+        const t = res()
+        await routes.get(`${P}/trash`)(get(`${P}/trash`), t)
+        assert.equal(t.status, 200)
+      } finally {
+        legacyListShape = false
+      }
     })
 
     await test('运行期间 /list 不清归档 ghost（防止长连客户端残留行复活）', async () => {

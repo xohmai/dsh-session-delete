@@ -128,13 +128,29 @@ export function apply(ctx) {
   let cachedHome = null
 
   /**
+   * 兼容两代 persistence.list() 的返回形状：
+   *   - 旧版（≤0.1.1-rc.x）：直接返回 header 数组；
+   *   - 0.1.5+：返回 { header, revision, sizeBytes } 快照数组。
+   * 统一解包成 header 数组。不解包的话 wrapper 会被当 header 用：
+   * h.id / h.cwd 全为 undefined，locate(wrapper) 深入到
+   * encodeSegment(undefined) 后抛 "reading 'length'"（v0.4.0 在
+   * DSH 0.1.5-alpha 上 /list、/trash 全挂的根因）。
+   * header 自身 schema 无 header 字段，`in` 判别不会误伤。
+   */
+  async function listHeaders() {
+    const result = await ctx.sessionPersistence.list()
+    if (!Array.isArray(result)) return []
+    return result.map((item) => (item !== null && typeof item === 'object' && 'header' in item ? item.header : item))
+  }
+
+  /**
    * DSH home 推导：优先从任一现存会话的 locate() 路径反推
    * （<home>/sessions/<projectKey>/<session-id>/session.jsonl.zstd），
    * 无会话时退回 DSH_HOME / ~/.dsh。
    */
   async function dshHome() {
     if (cachedHome) return cachedHome
-    const headers = await ctx.sessionPersistence.list()
+    const headers = await listHeaders()
     for (const header of headers) {
       const location = ctx.sessionPersistence.locate(header)
       if (location && typeof location.path === 'string') {
@@ -164,7 +180,7 @@ export function apply(ctx) {
 
   /** 磁盘会话清单：id → header。 */
   async function inventory() {
-    const headers = await ctx.sessionPersistence.list()
+    const headers = await listHeaders()
     const byId = new Map(headers.map((h) => [h.id, h]))
     return { headers, byId }
   }
