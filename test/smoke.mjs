@@ -46,6 +46,10 @@ const routes = new Map()
 // 默认模拟 DSH 0.1.5+ 的 list() 返回形状：{ header, revision, sizeBytes } 快照数组
 // （旧版 ≤0.1.1-rc.x 直接返回 header 数组；legacyListShape 测试单独覆盖旧形状）。
 let legacyListShape = false
+// 调用轨迹（验证零 I/O 投影缓存路径）：titleReadIds 记录实际解压读取过的
+// 会话 id；projCacheTitles 模拟 sessionProjectionCache 的 title 投影行。
+const titleReadIds = []
+const projCacheTitles = new Map()
 const ctx = {
   sessionPersistence: {
     list: async () => {
@@ -78,11 +82,23 @@ const ctx = {
   // 模拟真实 sessionQuery：readTitleSnapshots 返回的 title 是 SessionTitleSnapshot
   // 对象（含 title/messageSeqs/source/eventSeq/updatedAt），不是字符串。
   sessionQuery: {
-    readTitleSnapshots: async (ids) =>
-      ids.map((id) => ({
+    readTitleSnapshots: async (ids) => {
+      titleReadIds.push(...ids)
+      return ids.map((id) => ({
         status: 'fulfilled',
         value: { session: { id }, title: { title: `会话 ${id.slice(8, 12)}`, messageSeqs: [], source: 'user', eventSeq: 1, updatedAt: 1 } },
-      })),
+      }))
+    },
+  },
+  // 投影缓存桩（sessionProjectionCache 同构）：官方语义 seeded 头不走
+  // cachedSnapshot（走 predecessor），此处同样返回 undefined。
+  sessionProjectionCache: {
+    cachedSnapshot: (header, inheritedEventCount, keys) => {
+      if (header.isSeeded) return undefined
+      if (!projCacheTitles.has(header.id)) return undefined
+      return { asOfSeq: 1, values: { title: projCacheTitles.get(header.id) } }
+    },
+    cachedPredecessorTitle: () => undefined,
   },
   webServer: {
     register: (route) => routes.set(route.path, route.handler),
@@ -91,7 +107,12 @@ const ctx = {
     fn()
     return () => {}
   },
-  get: (name) => (name === 'sessionQuery' ? ctx.sessionQuery : undefined),
+  get: (name) =>
+    name === 'sessionQuery'
+      ? ctx.sessionQuery
+      : name === 'sessionProjectionCache'
+        ? ctx.sessionProjectionCache
+        : undefined,
 }
 
 apply(ctx)
@@ -242,6 +263,52 @@ const P = '/api/session-delete'
         oneShot.body.sessions.map((x) => x.id),
         '客户端按 mtimeMs 降序重排后应与 /list 顺序一致',
       )
+    })
+
+    await test('投影缓存命中：零 I/O 取标题，不触发日志解压', async () => {
+      const a = await createSession('session-proj1111-0000-4000-8000-0000000000a1', cwdA, 300)
+      const b = await createSession('session-proj2222-0000-4000-8000-0000000000b2', cwdA, 300)
+      projCacheTitles.set(a.id, '投影缓存标题A')
+      // b 故意不入缓存 → 应回退 readTitleSnapshots（解压路径）
+      const before = titleReadIds.length
+      const r = res()
+      await routes.get(`${P}/list-stream`)(get(`${P}/list-stream`), r)
+      const rows = new Map(
+        ndjson(r)
+          .filter((l) => l.type === 'session')
+          .map((l) => [l.session.id, l.session]),
+      )
+      assert.equal(rows.get(a.id)?.title, '投影缓存标题A', '命中会话应直接用投影缓存标题')
+      assert.equal(rows.get(b.id)?.title, `会话 ${b.id.slice(8, 12)}`, '未命中会话回退解压折叠')
+      const readAfter = titleReadIds.slice(before)
+      assert.ok(!readAfter.includes(a.id), '命中会话不应触发 readTitleSnapshots（零 I/O）')
+      assert.ok(readAfter.includes(b.id), '未命中会话应走 readTitleSnapshots 回退')
+      // mtime 记录缓存二次加载：两个会话都不再触发任何读取
+      const between = titleReadIds.length
+      const r2 = res()
+      await routes.get(`${P}/list-stream`)(get(`${P}/list-stream`), r2)
+      assert.equal(titleReadIds.length, between, 'recordCache 命中后不应再有解压读取')
+      projCacheTitles.clear()
+    })
+
+    await test('live 会话不走投影缓存（内存标题更新鲜）+ seeded 头回退', async () => {
+      const stale = await createSession('session-live2222-0000-4000-8000-0000000000c3', cwdA, 300)
+      liveIdle.add(stale.id)
+      projCacheTitles.set(stale.id, '过期的缓存标题') // 不应被采用
+      const seeded = await createSession('session-seed333-0000-4000-8000-0000000000d4', cwdA, 300)
+      seeded.isSeeded = true
+      projCacheTitles.set(seeded.id, 'seeded 的缓存标题') // seeded 走 predecessor，桩返回 undefined → 回退
+      const r = res()
+      await routes.get(`${P}/list-stream`)(get(`${P}/list-stream`), r)
+      const rows = new Map(
+        ndjson(r)
+          .filter((l) => l.type === 'session')
+          .map((l) => [l.session.id, l.session]),
+      )
+      assert.equal(rows.get(stale.id)?.title, `会话 ${stale.id.slice(8, 12)}`, 'live 会话标题应来自内存读取而非投影缓存')
+      assert.equal(rows.get(seeded.id)?.title, `会话 ${seeded.id.slice(8, 12)}`, 'seeded 头应回退解压路径')
+      liveIdle.delete(stale.id)
+      projCacheTitles.clear()
     })
 
     await test('POST /list-stream → 405', async () => {

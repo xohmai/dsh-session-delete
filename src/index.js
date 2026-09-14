@@ -313,6 +313,31 @@ export function apply(ctx) {
   }
 
   /**
+   * 零 I/O 标题：sessionProjectionCache 的 title 投影行——与侧栏 session.list
+   * 同源（打开页面即预热），冷会话首次加载不再逐个 zstd 解压整个日志
+   * （readTitleSnapshots 的 readColdSessionLog 路径；几百个会话时秒级）。
+   * 缓存行可能略旧但绝不会串会话（identity 以 createdAt/cwd/inheritedEventCount
+   * 见证，不匹配即拒）；seeded 会话按官方 apiproxy 同款规则走 predecessor 探测。
+   * miss / 服务缺失 / 旧版 API 不符时返回 undefined，由调用方回退解压路径。
+   * 仅用于冷会话：live 会话的标题在内存里本就新鲜且免费（readTitleSnapshots
+   * 对 live 走 sourceLive，无解压），避免吃到落后的检查点。
+   */
+  function cachedTitleFor(header) {
+    const cache = ctx.get('sessionProjectionCache')
+    if (cache === undefined || typeof cache?.cachedSnapshot !== 'function') return undefined
+    try {
+      const block = header.isSeeded
+        ? undefined
+        : cache.cachedSnapshot(header, 0, ['title']) ??
+          (typeof cache.cachedPredecessorTitle === 'function' ? cache.cachedPredecessorTitle(header, 0) : undefined)
+      const title = block?.values?.title
+      return typeof title === 'string' ? title : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
    * 记录缓存：id → { key, title, sizeBytes, mtimeMs }。
    * key = 日志文件 `mtime:size`——标题折叠需要 zstd 解压整个日志（44 个会话
    * 约 0.7s），但内容只有追加一种变化方式，文件 mtime+size 不变即可复用。
@@ -321,72 +346,117 @@ export function apply(ctx) {
   const recordCache = new Map()
 
   /**
-   * 单个会话的记录计算（list/preview/list-stream 共用）：
-   * 定位 → stat 日志文件 → 缓存命中判定 → 标题折叠（未命中时）→ 体积/mtime。
-   * 抽成单会话粒度是为了流式路由能逐个产出（见 /list-stream）。
+   * 阶段 1：逐会话预检（并行，纯 stat 无解压）。
+   * locate → stat 日志文件 → mtime 缓存命中判定。返回 prep 数组供后续阶段
+   * 与 buildRecord 复用（不重复 stat）。
    */
-  async function buildRecord(id, header, archived) {
-    const location = ctx.sessionPersistence.locate(header)
-    const dir = location && typeof location.path === 'string' ? dirname(location.path) : null
-    let key = null
-    if (location && typeof location.path === 'string') {
-      try {
-        const st = await stat(location.path)
-        key = `${st.mtimeMs}:${st.size}`
-      } catch {
-        key = null
+  async function prepRecords(ids, byId) {
+    return (
+      await Promise.all(
+        ids.map(async (id) => {
+          const header = byId.get(id)
+          if (header === undefined) return null
+          const location = ctx.sessionPersistence.locate(header)
+          const dir = location && typeof location.path === 'string' ? dirname(location.path) : null
+          let key = null
+          if (location && typeof location.path === 'string') {
+            try {
+              const st = await stat(location.path)
+              key = `${st.mtimeMs}:${st.size}`
+            } catch {
+              key = null
+            }
+          }
+          const agent = agentState(id)
+          const cached = recordCache.get(id)
+          // live 会话不缓存（内存态可能领先于磁盘）；日志 mtime+size 不变即可复用
+          const hit = !agent.live && key !== null && cached !== undefined && cached.key === key
+          return { id, header, dir, key, agent, cached, hit }
+        }),
+      )
+    ).filter((p) => p !== null)
+  }
+
+  /**
+   * 阶段 2：标题批量解析（仅对阶段 1 的缓存未命中者）。
+   *
+   * 关键性能约束：readTitleSnapshots 每次调用内部都会重扫整个持久化清单
+   * （listPersisted），逐会话单调用是准平方级——520 个会话实测 60s 都跑不完
+   * （v0.5.0 的教训）。miss 必须合并成一次批量调用，其内部自带
+   * persistedReadConcurrency 并发池解压。投影缓存命中（侧栏 session.list
+   * 同源，打开页面即预热）则完全绕开解压路径；recordCache 命中者标题随
+   * 缓存行返回，无需解析。live 会话不经投影缓存（内存标题更新鲜），归入
+   * miss 批——批量调用对 live 走 sourceLive 内存快照，无解压成本。
+   *
+   * @returns {Map<string, string|null>} id → 标题文本（无标题为 null）
+   */
+  async function resolveTitles(preps) {
+    const titles = new Map()
+    const misses = []
+    for (const p of preps) {
+      if (p.hit) continue
+      const cached = p.agent.live ? undefined : cachedTitleFor(p.header)
+      if (typeof cached === 'string') titles.set(p.id, cached)
+      else misses.push(p)
+    }
+    if (misses.length > 0) {
+      const folded = await titlesFor(misses.map((p) => p.id))
+      for (const p of misses) {
+        const text = folded.get(p.id)
+        titles.set(p.id, typeof text === 'string' ? text : null)
       }
     }
-    const agent = agentState(id)
-    const cached = recordCache.get(id)
-    // live 会话不缓存（内存态可能领先于磁盘）；日志 mtime+size 不变即可复用
-    const hit = !agent.live && key !== null && cached !== undefined && cached.key === key
+    return titles
+  }
 
+  /**
+   * 阶段 3：单个会话记录产出（list/preview/list-stream 共用）。
+   * prep（阶段 1）+ titles（阶段 2）已就绪，这里只补体积/mtime 并组装。
+   */
+  async function buildRecord(p, archived, titles) {
     let title
     let sizeBytes
     let mtimeMs
-    if (hit) {
-      title = cached.title
-      sizeBytes = cached.sizeBytes
-      mtimeMs = cached.mtimeMs
+    if (p.hit) {
+      title = p.cached.title
+      sizeBytes = p.cached.sizeBytes
+      mtimeMs = p.cached.mtimeMs
     } else {
-      const titles = await titlesFor([id])
-      title = typeof titles.get(id) === 'string' ? titles.get(id) : null
-      sizeBytes = dir ? await dirSize(dir) : 0
-      mtimeMs = dir ? await dirMtime(dir) : 0
-      if (key !== null) recordCache.set(id, { key, title, sizeBytes, mtimeMs })
-      else recordCache.delete(id)
+      const text = titles.get(p.id)
+      title = typeof text === 'string' ? text : null
+      sizeBytes = p.dir ? await dirSize(p.dir) : 0
+      mtimeMs = p.dir ? await dirMtime(p.dir) : 0
+      if (p.key !== null) recordCache.set(p.id, { key: p.key, title, sizeBytes, mtimeMs })
+      else recordCache.delete(p.id)
     }
     return {
-      id,
-      cwd: header.cwd ?? null,
-      createdAt: header.createdAt ?? null,
-      origin: header.origin ?? null,
-      delegationDepth: header.delegationDepth ?? 0,
+      id: p.id,
+      cwd: p.header.cwd ?? null,
+      createdAt: p.header.createdAt ?? null,
+      origin: p.header.origin ?? null,
+      delegationDepth: p.header.delegationDepth ?? 0,
       title,
-      archived: archived.has(id),
-      live: agent.live,
-      running: agent.running,
+      archived: archived.has(p.id),
+      live: p.agent.live,
+      running: p.agent.running,
       sizeBytes,
       mtimeMs,
     }
   }
 
   /**
-   * 并发池：limit 个 worker 抢占 id 队列，每个记录算完立即回调 onRecord。
+   * 并发池：limit 个 worker 抢占 prep 队列，每个记录算完立即回调 onRecord。
    * 流式路由据此逐个推送；sessionRecords 据此收集后统一排序。
    */
-  async function eachRecord(ids, byId, archived, limit, onRecord) {
+  async function eachRecord(preps, archived, titles, limit, onRecord) {
     let index = 0
     const worker = async () => {
-      while (index < ids.length) {
-        const id = ids[index++]
-        const header = byId.get(id)
-        if (header === undefined) continue
-        await onRecord(await buildRecord(id, header, archived))
+      while (index < preps.length) {
+        const prep = preps[index++]
+        await onRecord(await buildRecord(prep, archived, titles))
       }
     }
-    const width = Math.max(1, Math.min(limit, ids.length))
+    const width = Math.max(1, Math.min(limit, preps.length))
     await Promise.all(Array.from({ length: width }, () => worker()))
   }
 
@@ -395,8 +465,10 @@ export function apply(ctx) {
     const { byId } = await inventory()
     const archived = archivedSet()
     const target = (ids ?? [...byId.keys()]).filter((id) => byId.has(id))
+    const preps = await prepRecords(target, byId)
+    const titles = await resolveTitles(preps)
     const records = []
-    await eachRecord(target, byId, archived, 8, (record) => {
+    await eachRecord(preps, archived, titles, 16, (record) => {
       records.push(record)
     })
     records.sort((a, b) => b.mtimeMs - a.mtimeMs)
@@ -701,7 +773,6 @@ export function apply(ctx) {
         const { byId } = await inventory()
         const archived = archivedSet()
         const ids = [...byId.keys()]
-        const workspaces = await workspacesView()
         res.writeHead(200, {
           'content-type': 'application/x-ndjson; charset=utf-8',
           'cache-control': 'no-store',
@@ -709,9 +780,22 @@ export function apply(ctx) {
         const write = (obj) => {
           if (!res.writableEnded) res.write(`${JSON.stringify(obj)}\n`)
         }
-        write({ type: 'meta', total: ids.length, workspaces, unarchiveSupported: registryCanUnarchive() })
+        // meta 先行：total 来自 inventory（磁盘清单，快），进度分母即时可知
+        write({ type: 'meta', total: ids.length, workspaces: await workspacesView(), unarchiveSupported: registryCanUnarchive() })
+        // 阶段 1/2：stat 预检 + 标题批量解析（投影缓存命中为主，miss 合批一次
+        // 解压——见 resolveTitles 注释）。此阶段行尚未流出；缓存全热时毫秒级，
+        // 冷缓存全程解压时进度停在 0/N（一次性代价，侧栏预热后不再出现）。
+        let preps = []
+        let titles = new Map()
         try {
-          await eachRecord(ids, byId, archived, 8, (record) => write({ type: 'session', session: record }))
+          preps = await prepRecords(ids, byId)
+          titles = await resolveTitles(preps)
+        } catch (error) {
+          write({ type: 'error', message: String(error?.message ?? error) })
+        }
+        // 阶段 3：行快速流出（recordCache 命中者纯组装，miss 者补 dirSize）
+        try {
+          await eachRecord(preps, archived, titles, 16, (record) => write({ type: 'session', session: record }))
         } catch (error) {
           write({ type: 'error', message: String(error?.message ?? error) })
         }
