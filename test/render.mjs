@@ -174,6 +174,30 @@ await test('回收站页签有数据：名称 + 多选 + 批量按钮 + 底部�
   assert.ok(html.includes('type="checkbox"'), '回收站行应有复选框（多选）')
 })
 
+await test('首次加载：居中过渡动画 + 流式进度计数（已加载 N / M）', () => {
+  const html = renderToString(h(SettingsPage, {
+    close: () => {}, currentId: 'x',
+    initialListLoading: true, initialListProgress: { count: 2, total: 5 },
+  }))
+  assert.ok(html.includes('sd-spin'), '居中 spinner 应存在')
+  assert.ok(html.includes('正在读取会话数据'), '主文案')
+  assert.ok(html.includes('已加载 2 / 5 个会话'), '流式进度计数（count/total）')
+  // 居中布局：容器应为 flex 列 + 主轴/交叉轴居中 + 撑满滚动区高度
+  assert.ok(html.includes('justify-content:center'), '垂直居中')
+  assert.ok(html.includes('align-items:center'), '水平居中')
+  assert.ok(html.includes('height:100%'), '撑满滚动区以实现垂直居中')
+  assert.ok(!html.includes('加载中…'), '旧的左上角小字加载文案应已移除')
+})
+
+await test('回收站首次加载：居中动画（无计数）', () => {
+  const html = renderToString(h(SettingsPage, {
+    close: () => {}, currentId: 'x', initialTab: 'trash', initialTrashLoading: true,
+  }))
+  assert.ok(html.includes('正在读取回收站'), '回收站加载文案')
+  assert.ok(html.includes('justify-content:center'), '居中')
+  assert.ok(!html.includes('个会话'), '回收站是毫秒级接口，不显示计数')
+})
+
 if (failed.length) {
   console.error(`\nFAILED: ${failed.join(', ')}`)
   process.exit(1)

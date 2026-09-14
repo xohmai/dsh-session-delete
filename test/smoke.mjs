@@ -98,16 +98,28 @@ apply(ctx)
 
 // ---- 微型 req/res ----
 function res() {
-  const r = { status: 0, body: null, headersWritten: null }
+  const r = { status: 0, body: null, headersWritten: null, chunks: [] }
   r.writeHead = (status, headers) => {
     r.status = status
     r.headersWritten = headers
+  }
+  // 流式（NDJSON）路由用：收集写入的分块；返回 true 模拟可写（无背压）
+  r.write = (chunk) => {
+    r.chunks.push(String(chunk))
+    return true
   }
   r.end = (body) => {
     r.body = body ? JSON.parse(body) : null
   }
   return r
 }
+/** 解析 NDJSON 响应：拼接 chunks 后按行 parse（忽略空行）。 */
+const ndjson = (r) =>
+  r.chunks
+    .join('')
+    .split('\n')
+    .filter((line) => line.trim())
+    .map((line) => JSON.parse(line))
 const bodyReq = (method, url, obj, withHeader = true) => ({
   method,
   url,
@@ -181,6 +193,61 @@ const P = '/api/session-delete'
       } finally {
         legacyListShape = false
       }
+    })
+
+    await test('GET /list-stream：meta 首行 + 逐会话行 + done 收尾（NDJSON）', async () => {
+      const r = res()
+      await routes.get(`${P}/list-stream`)(get(`${P}/list-stream`), r)
+      assert.equal(r.status, 200)
+      assert.ok(String(r.headersWritten?.['content-type'] ?? '').startsWith('application/x-ndjson'), '应为 NDJSON content-type')
+      const lines = ndjson(r)
+      assert.ok(lines.length >= 5, `至少 meta + 3 会话 + done，实际 ${lines.length} 行`)
+      assert.equal(lines[0].type, 'meta', '首行必须是 meta')
+      assert.equal(lines[0].total, 3, 'meta.total 应即时给出会话总数')
+      assert.equal(lines[0].workspaces[0].title, 'project-a')
+      assert.equal(lines[0].unarchiveSupported, true)
+      assert.equal(lines.at(-1).type, 'done', '末行必须是 done')
+      const sessionLines = lines.filter((l) => l.type === 'session')
+      assert.equal(sessionLines.length, 3)
+      for (const line of sessionLines) {
+        assert.ok(typeof line.session.id === 'string' && line.session.id.startsWith('session-'), '会话行应有合法 id')
+        assert.ok(typeof line.session.title === 'string', '标题应已折叠为字符串')
+        assert.ok(typeof line.session.mtimeMs === 'number' && line.session.mtimeMs > 0)
+      }
+    })
+
+    await test('GET /list-stream 与 /list 内容一致（逐字段对比）', async () => {
+      const s = res()
+      await routes.get(`${P}/list-stream`)(get(`${P}/list-stream`), s)
+      const streamed = new Map(
+        ndjson(s)
+          .filter((l) => l.type === 'session')
+          .map((l) => [l.session.id, l.session]),
+      )
+      const oneShot = res()
+      await routes.get(`${P}/list`)(get(`${P}/list`), oneShot)
+      assert.equal(oneShot.body.sessions.length, streamed.size, '两边会话数应一致')
+      for (const rec of oneShot.body.sessions) {
+        const via = streamed.get(rec.id)
+        assert.ok(via, `流式应包含 ${rec.id}`)
+        for (const field of ['title', 'cwd', 'archived', 'live', 'running', 'sizeBytes', 'mtimeMs', 'delegationDepth']) {
+          assert.deepStrictEqual(via[field], rec[field], `${rec.id}.${field} 两边应一致`)
+        }
+      }
+      // 客户端排序约定：流式行本身无序，靠 mtimeMs 降序在客户端重排（此处验证
+      // /list 的排序键在流式行里同样存在且可用）
+      const sorted = [...streamed.values()].sort((a, b) => b.mtimeMs - a.mtimeMs)
+      assert.deepEqual(
+        sorted.map((x) => x.id),
+        oneShot.body.sessions.map((x) => x.id),
+        '客户端按 mtimeMs 降序重排后应与 /list 顺序一致',
+      )
+    })
+
+    await test('POST /list-stream → 405', async () => {
+      const r = res()
+      await routes.get(`${P}/list-stream`)(bodyReq('POST', `${P}/list-stream`, {}), r)
+      assert.equal(r.status, 405)
     })
 
     await test('运行期间 /list 不清归档 ghost（防止长连客户端残留行复活）', async () => {

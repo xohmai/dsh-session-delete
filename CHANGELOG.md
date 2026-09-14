@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.0
+
+- New: streaming session list with real progress. A new `GET /api/session-delete/list-stream` route emits NDJSON — a `meta` line first (total count, workspaces, unarchive capability) so the total is known immediately, then one line per session as soon as it is computed, then `done`. The client switches to this route and shows a live "已加载 N / M 个会话" counter instead of a bare wait; rows render once, sorted by `mtimeMs` (same order as before, no reshuffle flicker). The old one-shot `/list` route stays for compatibility and tests
+- UI: first-load transitions are now centered horizontally and vertically in the scroll area (spinner + label + live counter); the trash tab gets the same centered spinner without a counter (its endpoint is millisecond-fast). Reloads with existing data stay silent (old list remains usable, ↻ spins)
+- Perf: per-session record computation (`buildRecord`) runs through an 8-way concurrency pool shared by `/list`, `/preview` and `/list-stream`; title folding and dir sizing now interleave instead of two sequential phases
+
 ## 0.4.1
 
 - Fix (compat): DSH 0.1.5 changed `sessionPersistence.list()` to return `{ header, revision, sizeBytes }` snapshots instead of bare header arrays; the wrapper flowed into `locate()` and crashed every `/api/session-delete/list` and `/trash` request with "Cannot read properties of undefined (reading 'length')" (inside `encodeSegment(undefined)`). Both call sites now unwrap snapshots via a compat helper (`item.header ?? item`, same unwrap the official session-query uses), so both the new and the legacy (≤0.1.1-rc.x) shapes work

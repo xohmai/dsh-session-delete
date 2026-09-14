@@ -330,9 +330,12 @@ window.__ModuleLoader__.load({
       const [workspaces, setWorkspaces] = useState(props?.initialWorkspaces ?? [])
       const [trash, setTrash] = useState(props?.initialTrash ?? null)
       // 按数据域独立的加载/错误状态：回收站后台刷新不会干扰会话页签的按钮与错误提示
-      const [listLoading, setListLoading] = useState(false)
+      const [listLoading, setListLoading] = useState(props?.initialListLoading ?? false)
       const [listError, setListError] = useState(null)
-      const [trashLoading, setTrashLoading] = useState(false)
+      // 流式清单进度：{ count, total }——count 为已到达的会话行数，total 来自
+      // 首行 meta。仅首次加载（list === null）时展示，静默刷新不显示。
+      const [listProgress, setListProgress] = useState(props?.initialListProgress ?? null)
+      const [trashLoading, setTrashLoading] = useState(props?.initialTrashLoading ?? false)
       const [trashError, setTrashError] = useState(null)
       // 宿主 /list 上报的在线解除归档能力（registry 内部状态机可用性）；
       // 旧版 DSH 为 false：隐藏还原入口，保留离线 unhide 指引
@@ -353,18 +356,63 @@ window.__ModuleLoader__.load({
         return () => clearTimeout(timer)
       }, [notice?.at])
 
+      /**
+       * 流式拉取全量清单（/list-stream，NDJSON 逐行）：
+       * 首行 meta 带 total（即时知道总量）与 workspaces；随后每算完一个会话推
+       * 一行。行到达即更新计数（首次加载时居中动画显示「已加载 N / M」），
+       * 全部到齐后客户端按 mtimeMs 降序排序一次性渲染（与旧 /list 的服务端
+       * 排序同序，避免流式期间行序闪跳）。已有数据时静默刷新：保留旧列表，
+       * 仅右上角 ↻ 旋转。
+       */
       async function loadList() {
         setListLoading(true)
         setListError(null)
+        if (list === null) setListProgress({ count: 0, total: null })
         try {
-          const data = await api(`${PREFIX}/list`)
-          setList(data.sessions ?? [])
-          setWorkspaces(data.workspaces ?? [])
-          setUnarchiveSupported(data.unarchiveSupported === true)
+          const resp = await fetch(`${PREFIX}/list-stream`)
+          if (!resp.ok || !resp.body) {
+            let message = `HTTP ${resp.status}`
+            try {
+              const data = await resp.json().catch(() => ({}))
+              if (data?.error?.message) message = data.error.message
+            } catch {
+              /* 非 JSON 错误体保留 HTTP 状态码文案 */
+            }
+            throw new Error(message)
+          }
+          const rows = []
+          const reader = resp.body.getReader()
+          const decoder = new TextDecoder()
+          let buf = ''
+          for (;;) {
+            const { done, value } = await reader.read()
+            if (value) buf += decoder.decode(value, { stream: true })
+            const lines = buf.split('\n')
+            buf = lines.pop() ?? ''
+            for (const line of lines) {
+              if (!line.trim()) continue
+              const msg = JSON.parse(line)
+              if (msg.type === 'meta') {
+                setWorkspaces(msg.workspaces ?? [])
+                setUnarchiveSupported(msg.unarchiveSupported === true)
+                setListProgress((p) => ({ count: p?.count ?? 0, total: msg.total }))
+              } else if (msg.type === 'session') {
+                rows.push(msg.session)
+                setListProgress((p) => ({ count: rows.length, total: p?.total ?? null }))
+              } else if (msg.type === 'error') {
+                throw new Error(String(msg.message ?? '流式加载失败'))
+              }
+              // 'done'：循环自然结束，无需处理
+            }
+            if (done) break
+          }
+          rows.sort((a, b) => (b.mtimeMs ?? 0) - (a.mtimeMs ?? 0))
+          setList(rows)
         } catch (e) {
           setListError(String(e?.message ?? e))
         } finally {
           setListLoading(false)
+          setListProgress(null)
         }
       }
       async function loadTrash() {
@@ -863,8 +911,30 @@ window.__ModuleLoader__.load({
       }
 
       // ---------- 页签内容（仅滚动列表区） ----------
+      /**
+       * 首次加载的居中过渡动画：在滚动区（flex:1 定高）内水平垂直居中。
+       * spinner 下方显示主文案，流式清单再下方显示真实进度「已加载 N / M 个会话」。
+       */
+      function CenterLoading({ label, count, total }) {
+        return h(
+          'div',
+          { style: { height: '100%', minHeight: 160, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 10 } },
+          [
+            h('span', { key: 'i', className: 'sd-spin', style: { fontSize: 24, lineHeight: 1, color: T.secondary } }, '↻'),
+            h('div', { key: 't', style: { fontSize: 13, color: T.secondary } }, label),
+            count !== undefined && count !== null
+              ? h(
+                  'div',
+                  { key: 'c', style: { fontSize: 12, color: 'var(--dsw-alias-label-tertiary, var(--dsw-alias-label-secondary))', fontVariantNumeric: 'tabular-nums' } },
+                  `已加载 ${count}${typeof total === 'number' ? ` / ${total}` : ''} 个会话`,
+                )
+              : null,
+          ],
+        )
+      }
+
       function ArchivedTab() {
-        if (listLoading && list === null) return h('div', { style: { fontSize: 13, color: T.secondary, padding: '8px 0' } }, '加载中…')
+        if (listLoading && list === null) return h(CenterLoading, { label: '正在读取会话数据', count: listProgress?.count, total: listProgress?.total })
         if (archivedSessions.length === 0) {
           return h('div', { style: { fontSize: 13, color: T.secondary, padding: '8px 0', lineHeight: '20px' } }, [
             h('div', { key: 'a' }, '没有已归档的会话。'),
@@ -875,7 +945,7 @@ window.__ModuleLoader__.load({
       }
 
       function AllTab() {
-        if (listLoading && list === null) return h('div', { style: { fontSize: 13, color: T.secondary, padding: '8px 0' } }, '加载中…')
+        if (listLoading && list === null) return h(CenterLoading, { label: '正在读取会话数据', count: listProgress?.count, total: listProgress?.total })
         if (sessions.length === 0) return h('div', { style: { fontSize: 13, color: T.secondary, padding: '8px 0' } }, '没有可列出的会话')
         return h(
           'div',
@@ -913,7 +983,7 @@ window.__ModuleLoader__.load({
       }
 
       function TrashTab() {
-        if (trashLoading && trash === null) return h('div', { style: { fontSize: 13, color: T.secondary, padding: '8px 0' } }, '加载中…')
+        if (trashLoading && trash === null) return h(CenterLoading, { label: '正在读取回收站' })
         const items = trash ?? []
         return h(
           'div',

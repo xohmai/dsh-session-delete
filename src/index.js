@@ -320,70 +320,85 @@ export function apply(ctx) {
    */
   const recordCache = new Map()
 
-  /** 会话记录（list/preview 共用）：磁盘 + 归档 + agent 状态 + 占用。 */
+  /**
+   * 单个会话的记录计算（list/preview/list-stream 共用）：
+   * 定位 → stat 日志文件 → 缓存命中判定 → 标题折叠（未命中时）→ 体积/mtime。
+   * 抽成单会话粒度是为了流式路由能逐个产出（见 /list-stream）。
+   */
+  async function buildRecord(id, header, archived) {
+    const location = ctx.sessionPersistence.locate(header)
+    const dir = location && typeof location.path === 'string' ? dirname(location.path) : null
+    let key = null
+    if (location && typeof location.path === 'string') {
+      try {
+        const st = await stat(location.path)
+        key = `${st.mtimeMs}:${st.size}`
+      } catch {
+        key = null
+      }
+    }
+    const agent = agentState(id)
+    const cached = recordCache.get(id)
+    // live 会话不缓存（内存态可能领先于磁盘）；日志 mtime+size 不变即可复用
+    const hit = !agent.live && key !== null && cached !== undefined && cached.key === key
+
+    let title
+    let sizeBytes
+    let mtimeMs
+    if (hit) {
+      title = cached.title
+      sizeBytes = cached.sizeBytes
+      mtimeMs = cached.mtimeMs
+    } else {
+      const titles = await titlesFor([id])
+      title = typeof titles.get(id) === 'string' ? titles.get(id) : null
+      sizeBytes = dir ? await dirSize(dir) : 0
+      mtimeMs = dir ? await dirMtime(dir) : 0
+      if (key !== null) recordCache.set(id, { key, title, sizeBytes, mtimeMs })
+      else recordCache.delete(id)
+    }
+    return {
+      id,
+      cwd: header.cwd ?? null,
+      createdAt: header.createdAt ?? null,
+      origin: header.origin ?? null,
+      delegationDepth: header.delegationDepth ?? 0,
+      title,
+      archived: archived.has(id),
+      live: agent.live,
+      running: agent.running,
+      sizeBytes,
+      mtimeMs,
+    }
+  }
+
+  /**
+   * 并发池：limit 个 worker 抢占 id 队列，每个记录算完立即回调 onRecord。
+   * 流式路由据此逐个推送；sessionRecords 据此收集后统一排序。
+   */
+  async function eachRecord(ids, byId, archived, limit, onRecord) {
+    let index = 0
+    const worker = async () => {
+      while (index < ids.length) {
+        const id = ids[index++]
+        const header = byId.get(id)
+        if (header === undefined) continue
+        await onRecord(await buildRecord(id, header, archived))
+      }
+    }
+    const width = Math.max(1, Math.min(limit, ids.length))
+    await Promise.all(Array.from({ length: width }, () => worker()))
+  }
+
+  /** 会话记录（list/preview 共用）：磁盘 + 归档 + agent 状态 + 占用，mtime 降序。 */
   async function sessionRecords(ids) {
     const { byId } = await inventory()
     const archived = archivedSet()
-    const target = ids ?? [...byId.keys()]
-
-    // 第一遍（并行）：定位 + stat 日志文件，判定缓存命中
-    const prep = (
-      await Promise.all(
-        target.map(async (id) => {
-          const header = byId.get(id)
-          if (header === undefined) return null
-          const location = ctx.sessionPersistence.locate(header)
-          const dir = location && typeof location.path === 'string' ? dirname(location.path) : null
-          let key = null
-          if (location && typeof location.path === 'string') {
-            try {
-              const st = await stat(location.path)
-              key = `${st.mtimeMs}:${st.size}`
-            } catch {
-              key = null
-            }
-          }
-          const agent = agentState(id)
-          const cached = recordCache.get(id)
-          const hit = !agent.live && key !== null && cached !== undefined && cached.key === key
-          return { id, header, dir, key, agent, cached, hit }
-        }),
-      )
-    ).filter((p) => p !== null)
-
-    // 只对未命中的会话做标题折叠（这是主要成本）；live 会话永远新鲜读取
-    const titles = await titlesFor(prep.filter((p) => !p.hit).map((p) => p.id))
-
+    const target = (ids ?? [...byId.keys()]).filter((id) => byId.has(id))
     const records = []
-    for (const p of prep) {
-      let title
-      let sizeBytes
-      let mtimeMs
-      if (p.hit) {
-        title = p.cached.title
-        sizeBytes = p.cached.sizeBytes
-        mtimeMs = p.cached.mtimeMs
-      } else {
-        title = typeof titles.get(p.id) === 'string' ? titles.get(p.id) : null
-        sizeBytes = p.dir ? await dirSize(p.dir) : 0
-        mtimeMs = p.dir ? await dirMtime(p.dir) : 0
-        if (p.key !== null) recordCache.set(p.id, { key: p.key, title, sizeBytes, mtimeMs })
-        else recordCache.delete(p.id)
-      }
-      records.push({
-        id: p.id,
-        cwd: p.header.cwd ?? null,
-        createdAt: p.header.createdAt ?? null,
-        origin: p.header.origin ?? null,
-        delegationDepth: p.header.delegationDepth ?? 0,
-        title,
-        archived: archived.has(p.id),
-        live: p.agent.live,
-        running: p.agent.running,
-        sizeBytes,
-        mtimeMs,
-      })
-    }
+    await eachRecord(target, byId, archived, 8, (record) => {
+      records.push(record)
+    })
     records.sort((a, b) => b.mtimeMs - a.mtimeMs)
     return records
   }
@@ -633,6 +648,20 @@ export function apply(ctx) {
     }
   }
 
+  /** workspaceRegistry.list() 的稳定投影（/list 与 /list-stream 共用；失败退空）。 */
+  async function workspacesView() {
+    return Promise.resolve()
+      .then(() => ctx.workspaceRegistry.list())
+      .then((list) =>
+        (list ?? []).map((w) => ({
+          workspaceId: String(w.id ?? w.workspaceId ?? ''),
+          title: String(w.title ?? ''),
+          path: String(w.path ?? ''),
+        })),
+      )
+      .catch(() => [])
+  }
+
   ctx.effect(() =>
     ctx.webServer.register({
       kind: 'exact',
@@ -640,19 +669,7 @@ export function apply(ctx) {
       handler: guard(async (req, res) => {
         if (req.method !== 'GET') return sendJson(res, 405, { error: { code: 'METHOD', message: 'GET only' } })
         // 运行期间不做 ghost reconcile（见 reconcileArchivedGhosts 注释）。
-        const [sessions, workspaces] = await Promise.all([
-          sessionRecords(),
-          Promise.resolve()
-            .then(() => ctx.workspaceRegistry.list())
-            .then((list) =>
-              (list ?? []).map((w) => ({
-                workspaceId: String(w.id ?? w.workspaceId ?? ''),
-                title: String(w.title ?? ''),
-                path: String(w.path ?? ''),
-              })),
-            )
-            .catch(() => []),
-        ])
+        const [sessions, workspaces] = await Promise.all([sessionRecords(), workspacesView()])
         sendJson(res, 200, {
           ok: true,
           sessions,
@@ -660,6 +677,46 @@ export function apply(ctx) {
           archivedCount: sessions.filter((s) => s.archived).length,
           unarchiveSupported: registryCanUnarchive(),
         })
+      }),
+    }),
+  )
+
+  /**
+   * 流式全量清单（NDJSON，逐行 JSON 对象 + '\n'）：
+   *   { type: 'meta', total, workspaces, unarchiveSupported }   首行，总数即时可知
+   *   { type: 'session', session }                              每算完一个会话推一行
+   *   { type: 'error', message }                                中途失败（此后仍发 done 收尾）
+   *   { type: 'done' }                                          结束标记
+   * 与一次性 /list 内容同源（buildRecord）；排序交给客户端（mtimeMs 降序），
+   * 服务端流式期间无序产出。会话多时（标题折叠要 zstd 解压整个日志）一次性
+   * /list 首次可达数秒，本路由让客户端从第一行起就显示「已加载 N / M」。
+   * GET 免自定义头（与其它 GET 一致）；行很小（~200B），无需背压处理。
+   */
+  ctx.effect(() =>
+    ctx.webServer.register({
+      kind: 'exact',
+      path: `${PREFIX}/list-stream`,
+      handler: guard(async (req, res) => {
+        if (req.method !== 'GET') return sendJson(res, 405, { error: { code: 'METHOD', message: 'GET only' } })
+        const { byId } = await inventory()
+        const archived = archivedSet()
+        const ids = [...byId.keys()]
+        const workspaces = await workspacesView()
+        res.writeHead(200, {
+          'content-type': 'application/x-ndjson; charset=utf-8',
+          'cache-control': 'no-store',
+        })
+        const write = (obj) => {
+          if (!res.writableEnded) res.write(`${JSON.stringify(obj)}\n`)
+        }
+        write({ type: 'meta', total: ids.length, workspaces, unarchiveSupported: registryCanUnarchive() })
+        try {
+          await eachRecord(ids, byId, archived, 8, (record) => write({ type: 'session', session: record }))
+        } catch (error) {
+          write({ type: 'error', message: String(error?.message ?? error) })
+        }
+        write({ type: 'done' })
+        res.end()
       }),
     }),
   )
