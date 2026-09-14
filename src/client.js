@@ -432,10 +432,13 @@ window.__ModuleLoader__.load({
         setNotice(null)
         setArm(null)
         setSelected(new Set())
-        // 页签切入总是重拉：/trash 毫秒级、/list 有宿主 mtime 缓存，均为无感刷新；
-        // 若只在 null 时加载，删除/还原后切回页签会展示陈旧列表。
-        if (tab === 'trash') loadTrash()
-        else {
+        // 仅首次（数据为 null）拉取；已有数据直接展示——删除/还原后各动作
+        // 已显式调 loadList/loadTrash 同步，页签来回切换不再重拉（要刷新点 ↻）。
+        if (tab === 'trash') {
+          if (trash === null) loadTrash()
+          return
+        }
+        if (list === null) {
           loadList()
           // 预载回收站计数：首开即有「回收站 (N)」徽标，删除后能立即递增
           if (trash === null) loadTrash()

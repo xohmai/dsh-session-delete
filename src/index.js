@@ -324,16 +324,19 @@ export function apply(ctx) {
    */
   function cachedTitleFor(header) {
     const cache = ctx.get('sessionProjectionCache')
-    if (cache === undefined || typeof cache?.cachedSnapshot !== 'function') return undefined
+    if (cache === undefined || typeof cache?.cachedSnapshot !== 'function') return { title: undefined, via: 'no-service' }
     try {
       const block = header.isSeeded
         ? undefined
-        : cache.cachedSnapshot(header, 0, ['title']) ??
-          (typeof cache.cachedPredecessorTitle === 'function' ? cache.cachedPredecessorTitle(header, 0) : undefined)
-      const title = block?.values?.title
-      return typeof title === 'string' ? title : undefined
-    } catch {
-      return undefined
+        : cache.cachedSnapshot(header, 0, ['title'])
+      if (block !== undefined && typeof block.values?.title === 'string') return { title: block.values.title, via: 'snapshot' }
+      if (typeof cache.cachedPredecessorTitle === 'function') {
+        const pred = cache.cachedPredecessorTitle(header, 0)
+        if (pred !== undefined && typeof pred.values?.title === 'string') return { title: pred.values.title, via: 'predecessor' }
+      }
+      return { title: undefined, via: 'miss' }
+    } catch (error) {
+      return { title: undefined, via: `error:${String(error?.message ?? error).slice(0, 60)}` }
     }
   }
 
@@ -349,7 +352,42 @@ export function apply(ctx) {
    * 阶段 1：逐会话预检（并行，纯 stat 无解压）。
    * locate → stat 日志文件 → mtime 缓存命中判定。返回 prep 数组供后续阶段
    * 与 buildRecord 复用（不重复 stat）。
+   *
+   * locate() 返回的是「当前代」文件名（如 session.v3.jsonl.zstd）——这是
+   * 追加写入的目标路径。尚未迁移的旧格式会话磁盘上只有旧代文件
+   * （version 0 保留原名 session.jsonl.zstd），对它们 stat locate 路径必然
+   * ENOENT；若就此放弃，mtime 缓存永远无法为这些会话升温（每次全量重算，
+   * 旧格式存量越多越慢——v0.5.1 之前 8s 稳态的元凶之一）。这里在 ENOENT
+   * 时回退：readdir 会话目录，选版本号最高的那代日志文件作为缓存键源。
    */
+  const GEN_RE = /^session(?:\.v(\d+))?\.jsonl(?:\.zstd)?$/
+  async function locateLogFile(dir, locatedPath) {
+    try {
+      await stat(locatedPath)
+      return locatedPath
+    } catch {
+      /* 当前代文件不存在：扫描目录找实际存在的最高代 */
+    }
+    try {
+      const entries = await readdir(dir, { withFileTypes: true })
+      let best = null
+      let bestVer = -1
+      for (const e of entries) {
+        if (!e.isFile()) continue
+        const m = GEN_RE.exec(e.name)
+        if (m === null) continue
+        const ver = m[1] === undefined ? 0 : Number(m[1])
+        if (ver > bestVer) {
+          bestVer = ver
+          best = join(dir, e.name)
+        }
+      }
+      return best
+    } catch {
+      return null
+    }
+  }
+
   async function prepRecords(ids, byId) {
     return (
       await Promise.all(
@@ -359,12 +397,15 @@ export function apply(ctx) {
           const location = ctx.sessionPersistence.locate(header)
           const dir = location && typeof location.path === 'string' ? dirname(location.path) : null
           let key = null
-          if (location && typeof location.path === 'string') {
-            try {
-              const st = await stat(location.path)
-              key = `${st.mtimeMs}:${st.size}`
-            } catch {
-              key = null
+          if (dir !== null) {
+            const logFile = await locateLogFile(dir, location.path)
+            if (logFile !== null) {
+              try {
+                const st = await stat(logFile)
+                key = `${st.mtimeMs}:${st.size}`
+              } catch {
+                key = null
+              }
             }
           }
           const agent = agentState(id)
@@ -388,16 +429,28 @@ export function apply(ctx) {
    * 缓存行返回，无需解析。live 会话不经投影缓存（内存标题更新鲜），归入
    * miss 批——批量调用对 live 走 sourceLive 内存快照，无解压成本。
    *
-   * @returns {Map<string, string|null>} id → 标题文本（无标题为 null）
+   * @returns {{titles: Map<string, string|null>, stats: object}} id → 标题文本 + 来源统计
    */
   async function resolveTitles(preps) {
     const titles = new Map()
     const misses = []
+    const stats = { recordHits: 0, snapshot: 0, predecessor: 0, miss: 0, noService: 0, errors: {} }
     for (const p of preps) {
-      if (p.hit) continue
-      const cached = p.agent.live ? undefined : cachedTitleFor(p.header)
-      if (typeof cached === 'string') titles.set(p.id, cached)
-      else misses.push(p)
+      if (p.hit) {
+        stats.recordHits += 1
+        continue
+      }
+      const { title, via } = p.agent.live ? { title: undefined, via: 'live' } : cachedTitleFor(p.header)
+      if (typeof title === 'string') {
+        titles.set(p.id, title)
+        if (via === 'snapshot') stats.snapshot += 1
+        else if (via === 'predecessor') stats.predecessor += 1
+        continue
+      }
+      if (via === 'no-service') stats.noService += 1
+      else if (via === 'miss') stats.miss += 1
+      else if (via.startsWith('error:')) stats.errors[via] = (stats.errors[via] ?? 0) + 1
+      misses.push(p)
     }
     if (misses.length > 0) {
       const folded = await titlesFor(misses.map((p) => p.id))
@@ -406,7 +459,8 @@ export function apply(ctx) {
         titles.set(p.id, typeof text === 'string' ? text : null)
       }
     }
-    return titles
+    stats.batched = misses.length
+    return { titles, stats }
   }
 
   /**
@@ -466,7 +520,7 @@ export function apply(ctx) {
     const archived = archivedSet()
     const target = (ids ?? [...byId.keys()]).filter((id) => byId.has(id))
     const preps = await prepRecords(target, byId)
-    const titles = await resolveTitles(preps)
+    const { titles } = await resolveTitles(preps)
     const records = []
     await eachRecord(preps, archived, titles, 16, (record) => {
       records.push(record)
@@ -770,9 +824,11 @@ export function apply(ctx) {
       path: `${PREFIX}/list-stream`,
       handler: guard(async (req, res) => {
         if (req.method !== 'GET') return sendJson(res, 405, { error: { code: 'METHOD', message: 'GET only' } })
+        const t0 = Date.now()
         const { byId } = await inventory()
         const archived = archivedSet()
         const ids = [...byId.keys()]
+        const tInv = Date.now()
         res.writeHead(200, {
           'content-type': 'application/x-ndjson; charset=utf-8',
           'cache-control': 'no-store',
@@ -787,19 +843,36 @@ export function apply(ctx) {
         // 冷缓存全程解压时进度停在 0/N（一次性代价，侧栏预热后不再出现）。
         let preps = []
         let titles = new Map()
+        let titleStats = {}
         try {
+          const tPrep = Date.now()
           preps = await prepRecords(ids, byId)
-          titles = await resolveTitles(preps)
+          const tTitle = Date.now()
+          const resolved = await resolveTitles(preps)
+          titles = resolved.titles
+          titleStats = resolved.stats
+          titleStats.prepMs = tTitle - tPrep
+          titleStats.titleMs = Date.now() - tTitle
         } catch (error) {
           write({ type: 'error', message: String(error?.message ?? error) })
         }
         // 阶段 3：行快速流出（recordCache 命中者纯组装，miss 者补 dirSize）
+        const tRows = Date.now()
         try {
           await eachRecord(preps, archived, titles, 16, (record) => write({ type: 'session', session: record }))
         } catch (error) {
           write({ type: 'error', message: String(error?.message ?? error) })
         }
-        write({ type: 'done' })
+        // done 行附带阶段耗时与标题来源统计（诊断性能用，客户端可忽略）
+        write({
+          type: 'done',
+          stats: {
+            total: ids.length,
+            inventoryMs: tInv - t0,
+            rowMs: Date.now() - tRows,
+            ...titleStats,
+          },
+        })
         res.end()
       }),
     }),
