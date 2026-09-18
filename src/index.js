@@ -325,13 +325,18 @@ export function apply(ctx) {
   function cachedTitleFor(header) {
     const cache = ctx.get('sessionProjectionCache')
     if (cache === undefined || typeof cache?.cachedSnapshot !== 'function') return { title: undefined, via: 'no-service' }
+    // 旧格式（v0）会话的持久化 header 不带 isSeeded 字段（undefined），而投影
+    // 缓存的 identity 匹配只对存储侧做 `?? false` 默认——期望侧是 undefined 时
+    // lifecycle 永远不等，snapshot/predecessor 双双落空（实测 predecessor 0 命中，
+    // 每次重启首次加载退回全量解压）。这里把 identity 输入归一为 false。
+    const meta = header.isSeeded === undefined ? { ...header, isSeeded: false } : header
     try {
-      const block = header.isSeeded
+      const block = meta.isSeeded
         ? undefined
-        : cache.cachedSnapshot(header, 0, ['title'])
+        : cache.cachedSnapshot(meta, 0, ['title'])
       if (block !== undefined && typeof block.values?.title === 'string') return { title: block.values.title, via: 'snapshot' }
       if (typeof cache.cachedPredecessorTitle === 'function') {
-        const pred = cache.cachedPredecessorTitle(header, 0)
+        const pred = cache.cachedPredecessorTitle(meta, 0)
         if (pred !== undefined && typeof pred.values?.title === 'string') return { title: pred.values.title, via: 'predecessor' }
       }
       return { title: undefined, via: 'miss' }
