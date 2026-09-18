@@ -440,7 +440,11 @@ export function apply(ctx) {
     const titles = new Map()
     const misses = []
     const stats = { recordHits: 0, snapshot: 0, predecessor: 0, miss: 0, noService: 0, errors: {} }
+    // 根因验证字段：持久化 header 里 isSeeded 缺失（undefined）的会话数——
+    // 这正是投影缓存 identity 匹配对旧格式会话全部落空的前提（见 cachedTitleFor）。
+    stats.headerNoIsSeeded = 0
     for (const p of preps) {
+      if (p.header.isSeeded === undefined) stats.headerNoIsSeeded += 1
       if (p.hit) {
         stats.recordHits += 1
         continue
