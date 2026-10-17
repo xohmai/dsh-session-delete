@@ -256,27 +256,36 @@ export function apply(ctx) {
   function registryCanUnarchive() {
     const registry = ctx.workspaceRegistry
     return (
-      typeof registry?.enqueueOperation === 'function' &&
-      typeof registry?.requireState === 'function' &&
-      typeof registry?.setState === 'function'
+      typeof registry?.unarchiveSession === 'function' ||
+      (typeof registry?.enqueueOperation === 'function' &&
+        typeof registry?.requireState === 'function' &&
+        typeof registry?.setState === 'function')
     )
   }
 
   async function unarchiveSession(id) {
+    const registry = ctx.workspaceRegistry
     if (!registryCanUnarchive()) {
       throw httpError(501, 'UNSUPPORTED', '当前 DSH 的 workspaceRegistry 不支持在线取消归档；请停止 DSH 后运行 tools/unhide.mjs')
     }
-    const registry = ctx.workspaceRegistry
-    // 走 registry 自己的串行队列，与并发的归档/工作区写操作互斥
-    return registry.enqueueOperation(async () => {
-      const state = registry.requireState()
-      if (!Array.isArray(state.archivedSessionIds) || !state.archivedSessionIds.includes(id)) return false
-      await registry.setState({
-        ...state,
-        archivedSessionIds: state.archivedSessionIds.filter((x) => x !== id),
+    const wasArchived = archivedSet().has(id)
+    if (typeof registry.unarchiveSession === 'function') {
+      // 新版 DSH：走公开的 unarchiveSession，内部自带串行队列 + 落盘 + 广播，
+      // 与归档完全对称。
+      await registry.unarchiveSession(id)
+    } else {
+      // 旧版 DSH 回退：手动走内部状态机（与 archiveSession 同源），保持原兼容性。
+      await registry.enqueueOperation(async () => {
+        const state = registry.requireState()
+        if (!Array.isArray(state.archivedSessionIds) || !state.archivedSessionIds.includes(id)) return false
+        await registry.setState({
+          ...state,
+          archivedSessionIds: state.archivedSessionIds.filter((x) => x !== id),
+        })
+        return true
       })
-      return true
-    })
+    }
+    return wasArchived && !archivedSet().has(id)
   }
 
   /**
@@ -615,6 +624,9 @@ export function apply(ctx) {
       // 目录已不存在（例如此前删了一半）：归档已完成，直接视为成功。
       const keptHidden = archivedSet().has(id)
       await audit('delete', { id, note: 'dir-missing', keptHidden })
+      // 通知所有客户端从会话列表 store 里移除该行（typert emit 广播；
+      // mock/旧版 ctx 无 emit 时静默跳过）。
+      ctx.emit?.('api-session/removed', id)
       return { id, ok: true, note: 'dir-missing', keptHidden }
     }
     const sizeBytes = await dirSize(dir)
@@ -660,6 +672,11 @@ export function apply(ctx) {
     // reconcileArchivedGhosts 统一清理。
     const keptHidden = archivedSet().has(id)
     await audit('delete', { id, entry, keptHidden })
+    // 关键修复：显式广播 api-session/removed，让 typert 协议把「会话已删除」
+    // 推给所有客户端，客户端据此把残留行从 list store 里剪掉——没有这一步，
+    // 冷会话被删后宿主不发任何帧，行会一直留在侧栏（点开即 session/not-found）。
+    // mock/旧版 ctx 无 emit 时静默跳过（?. 防御）。
+    ctx.emit?.('api-session/removed', id)
     recordCache.delete(id)
     return { id, ok: true, entry, keptHidden }
   }
@@ -761,6 +778,26 @@ export function apply(ctx) {
       stillArchived = archivedSet().has(meta.id)
     }
     await audit('restore', { id: meta.id, entry, unarchived: !stillArchived })
+    // 删除时已通过 api-session/removed 把该行从客户端 list store 剪掉，这里
+    // 用最小摘要补回（title 由投影缓存/后续 refreshProjections 补齐）。
+    try {
+      const headers = await listHeaders()
+      const header = headers.find((h) => h.id === meta.id)
+      if (header !== undefined) {
+        ctx.emit('api-session/added', {
+          sessionId: meta.id,
+          updatedAt: header.createdAt ?? Date.now(),
+          agentAvailable: false,
+          running: false,
+          blank: false,
+          ...(header.parentSession === undefined ? {} : { parentSessionId: header.parentSession }),
+          ...(header.origin === undefined ? {} : { origin: header.origin }),
+          ...(header.cwd === undefined ? {} : { cwd: header.cwd }),
+        })
+      }
+    } catch {
+      /* 客户端列表补回失败不影响还原结果 */
+    }
     recordCache.delete(meta.id)
     return { id: meta.id, ok: true, stillArchived }
   }
