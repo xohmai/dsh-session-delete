@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.1
+
+- Fix (PR #4): deleting a session now broadcasts `api-session/removed` to every connected client, so sidebar rows are pruned immediately everywhere — previously only the acting client refreshed its list, leaving stale rows in other clients that failed with `session/not-found` when opened. Verified end-to-end against DSH source before merging: the event is whitelisted in `dsh-api-remotes`' forwarded-event registry (cordis emits from plugin contexts reach it the same way `plugin-market/changed` does), and the client's `handleSessionRemoved` is no-op-safe for cold, non-resident sessions while still recording the store removal. Double emission when the host later disposes a live session is idempotent
+- Fix (PR #4): restoring from trash broadcasts `api-session/added` with a minimal summary so the row reappears in connected clients without waiting for a baseline refresh; the summary now carries `formatStatus: "current"` like the host's own `summaryFor` (follow-up to the PR)
+- Prefer the public `workspaceRegistry.unarchiveSession()` on current DSH (same serial queue and persistence as `archiveSession`); the internal state-machine path stays as the legacy fallback (≤0.1.1-rc.x) and capability detection is unchanged
+- Tests: emit assertions for the delete/restore broadcasts; the smoke stub now encodes session-directory names the same way the core does, fixing the Windows-only mkdir failures the PR author reported (raw `:` from IM ids is not a legal directory name on NTFS)
+- Known edge (core semantics, not a bug): official clients treat `origin === "subagent"` rows as durable — `api-session/removed` only marks them not-running; such rows disappear on the client's next list refresh
+
 ## 0.5.0
 
 - New: streaming session list with real progress. A new `GET /api/session-delete/list-stream` route emits NDJSON — a `meta` line first (total count, workspaces, unarchive capability) so the total is known immediately, then one line per session as soon as it is computed, then `done`. The client switches to this route and shows a live "已加载 N / M 个会话" counter instead of a bare wait; rows render once, sorted by `mtimeMs` (same order as before, no reshuffle flicker). The old one-shot `/list` route stays for compatibility and tests

@@ -29,14 +29,28 @@ const liveIdle = new Set() // id -> attach 在内存里但空闲（「打开中�
 function slug(cwd) {
   return `--${cwd.replace(/\//g, '-').slice(1)}--`
 }
+/**
+ * 与核心 dsh-session-persistence-jsonl encodeSegment 同款的 id → 目录名转义。
+ * 桩里会话目录必须用它（测试 id 含 `:` 等 IM 渠道字符时，Windows 不允许直接建目录；
+ * 插件本体的回收站条目转义见 src/index.js encodeEntrySegment，PR #4 报告者实测发现）。
+ */
+function segOf(raw) {
+  let out = ''
+  for (let i = 0; i < raw.length; i++) {
+    const code = raw.charCodeAt(i)
+    const ch = String.fromCharCode(code)
+    out += ch !== '~' && /[A-Za-z0-9._-]/.test(ch) ? ch : '~' + code.toString(16).toUpperCase().padStart(4, '0')
+  }
+  return out
+}
 function locate(header) {
-  return { kind: 'jsonl', path: join(sessionsRoot, slug(header.cwd), header.id, 'session.jsonl.zstd') }
+  return { kind: 'jsonl', path: join(sessionsRoot, slug(header.cwd), segOf(header.id), 'session.jsonl.zstd') }
 }
 
 async function createSession(id, cwd, bytes = 128) {
   const header = { type: 'session', version: 1, id, createdAt: Date.now() - 86400000, delegationDepth: 0, cwd }
   headers.push(header)
-  const dir = join(sessionsRoot, slug(cwd), id)
+  const dir = join(sessionsRoot, slug(cwd), segOf(id))
   await mkdir(dir, { recursive: true })
   await writeFile(join(dir, 'session.jsonl.zstd'), 'x'.repeat(bytes))
   return header
@@ -50,7 +64,12 @@ let legacyListShape = false
 // 会话 id；projCacheTitles 模拟 sessionProjectionCache 的 title 投影行。
 const titleReadIds = []
 const projCacheTitles = new Map()
+// ctx.emit 调用轨迹（PR #4：删除/还原向所有客户端广播 api-session/* 事件）
+const emitLog = []
 const ctx = {
+  emit: (event, ...args) => {
+    emitLog.push([event, ...args])
+  },
   sessionPersistence: {
     list: async () => {
       const items = headers.slice()
@@ -412,6 +431,41 @@ const P = '/api/session-delete'
       headers.push({ type: 'session', version: 1, id: 'session-aaaa1111-0000-4000-8000-000000000001', createdAt: Date.now(), delegationDepth: 0, cwd: cwdA })
     })
 
+    await test('删除/还原向所有客户端广播 api-session 事件（PR #4）', async () => {
+      emitLog.length = 0
+      const id = 'session-eeee5555-0000-4000-8000-000000000005'
+      await createSession(id, cwdA, 64)
+
+      // 删除 → api-session/removed（裸 id 字符串载荷，与宿主 session/disposed 同形）
+      const rDel = res()
+      await routes.get(`${P}/delete`)(bodyReq('POST', `${P}/delete`, { id }), rDel)
+      assert.equal(rDel.status, 200, JSON.stringify(rDel.body))
+      headers.splice(headers.findIndex((x) => x.id === id), 1)
+      assert.ok(
+        emitLog.some(([event, arg]) => event === 'api-session/removed' && arg === id),
+        `删除应广播 api-session/removed，实际 ${JSON.stringify(emitLog)}`,
+      )
+
+      // 还原 → api-session/added（最小摘要：sessionId/formatStatus 等与宿主 summaryFor 对齐）。
+      // 先把 header 推回桩清单，模拟真实场景「文件已归位、持久化 list() 重新可见」。
+      headers.push({ type: 'session', version: 1, id, createdAt: Date.now() - 86400000, delegationDepth: 0, cwd: cwdA })
+      const r = res()
+      await routes.get(`${P}/restore`)(bodyReq('POST', `${P}/restore`, { entry: rDel.body.entry }), r)
+      assert.equal(r.status, 200, JSON.stringify(r.body))
+      const added = emitLog.find(([event]) => event === 'api-session/added')
+      assert.ok(added, `还原应广播 api-session/added，实际 ${JSON.stringify(emitLog)}`)
+      assert.equal(added[1].sessionId, id)
+      assert.equal(added[1].formatStatus, 'current', 'added 摘要必须带 formatStatus（宿主 summaryFor 恒带）')
+      assert.equal(added[1].running, false)
+      assert.equal(added[1].cwd, cwdA)
+
+      // 清理：再删一次并彻底清空，不影响后续测试的回收站断言
+      const rDel2 = res()
+      await routes.get(`${P}/delete`)(bodyReq('POST', `${P}/delete`, { id }), rDel2)
+      headers.splice(headers.findIndex((x) => x.id === id), 1)
+      await routes.get(`${P}/purge`)(bodyReq('POST', `${P}/purge`, { entry: rDel2.body.entry }), res())
+    })
+
     await test('POST /unarchive 在线解除归档（幂等 + 审计）', async () => {
       const id = 'session-aaaa2222-0000-4000-8000-000000000002'
       await ctx.workspaceRegistry.archiveSession(id) // 模拟侧栏「归档会话」
@@ -695,15 +749,16 @@ const P = '/api/session-delete'
     })
 
     await test('极端长 id 转义膨胀越界 → 拒绝删除而非制造不可还原条目', async () => {
-      // 150 字符合法 id，其中 50 个 `:` 各膨胀 4 倍 → 条目名 16+100+200=316 > 240
+      // 150 字符合法 id，其中 50 个 `:` 各膨胀 4 倍 → 条目名 16+100+200=316 > 240。
+      // 不建磁盘目录：越界校验在 inventory 之前，条目从未被触碰（且转义后的目录名
+      // 会超出 Linux 255 字节上限，真实磁盘上也不可能存在这种会话目录）。
       const longId = 'a:'.repeat(50) + 'a'.repeat(50)
-      await createSession(longId, cwdA, 32)
+      headers.push({ type: 'session', version: 1, id: longId, createdAt: Date.now(), delegationDepth: 0, cwd: cwdA })
       const r = res()
       await routes.get(`${P}/delete`)(bodyReq('POST', `${P}/delete`, { id: longId }), r)
       assert.equal(r.status, 400, `转义越界的 id 应 400，实际 ${r.status}`)
-      // 目录仍在原地（未归档未移动——校验发生在动手之前）
-      const st = await stat(join(sessionsRoot, slug(cwdA), longId))
-      assert.ok(st.isDirectory(), '会话目录应原样保留')
+      // 未归档未移动——校验发生在动手之前
+      assert.ok(!archived.has(longId), '不应产生任何归档副作用')
       headers.splice(headers.findIndex((x) => x.id === longId), 1)
     })
 

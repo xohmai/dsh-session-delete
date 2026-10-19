@@ -788,6 +788,7 @@ export function apply(ctx) {
           sessionId: meta.id,
           updatedAt: header.createdAt ?? Date.now(),
           agentAvailable: false,
+          formatStatus: 'current',
           running: false,
           blank: false,
           ...(header.parentSession === undefined ? {} : { parentSessionId: header.parentSession }),
