@@ -111,7 +111,8 @@ await test('ArchiveSettingsSection 无 standard props（useSessions 缺失走 fa
 // 只在「列表非空」路径执行，空态测试测不到，用户点开页签才爆。
 const mkSession = (over = {}) => ({
   id: 'session-test-0001', cwd: '/tmp/proj', createdAt: Date.now() - 86400000,
-  origin: null, delegationDepth: 0, title: '测试会话', archived: true,
+  origin: null, delegationDepth: 0, parentSession: null, subagents: 0, orphan: false,
+  title: '测试会话', archived: true,
   live: false, running: false, sizeBytes: 4096, mtimeMs: Date.now() - 3600e3, ...over,
 })
 
@@ -157,6 +158,20 @@ await test('全部会话页签有数据：分组头 + 行 + 搜索/过滤工具�
   assert.equal((html.match(/sd-check/g) ?? []).length, 4, '会话行与分组头的复选框都应挂 sd-check 类')
 })
 
+await test('全部会话页签：子会话计数 + 孤儿标记 + 孤儿过滤按钮（issue #5）', () => {
+  const list = [
+    mkSession({ id: 'session-test-0001', archived: false, subagents: 3 }),
+    mkSession({ id: 'session-test-0002', archived: false, cwd: '/tmp/other', origin: 'subagent', orphan: true, parentSession: 'session-gone' }),
+  ]
+  const html = renderToString(h(SettingsPage, {
+    close: () => {}, currentId: 'x', initialTab: 'all', initialList: list,
+    initialWorkspaces: [{ workspaceId: 'w1', title: 'proj', path: '/tmp/proj' }],
+  }))
+  assert.ok(html.includes('子会话 ×3'), '后代计数标记（删除将连带）')
+  assert.ok(html.includes('孤儿 (1)'), '孤儿过滤按钮（仅存在孤儿时出现）')
+  assert.ok(html.includes('>孤儿</span>'), '孤儿行标记')
+})
+
 await test('回收站页签有数据：名称 + 多选 + 批量按钮 + 底部清空栏', () => {
   const trash = [
     { entry: '20260801-000000-session-test-0001', id: 'session-test-0001', title: '被删的会话', cwd: '/tmp', trashedAt: new Date().toISOString(), sizeBytes: 4096 },
@@ -172,6 +187,15 @@ await test('回收站页签有数据：名称 + 多选 + 批量按钮 + 底部�
   assert.ok(html.includes('全选'), '全选按钮')
   assert.ok(html.includes('清空回收站'), '底部清空栏')
   assert.ok(html.includes('type="checkbox"'), '回收站行应有复选框（多选）')
+})
+
+await test('回收站：子代理条目带「子代理」标记（issue #5）', () => {
+  const trash = [
+    { entry: '20260801-000000-casc-r1', id: 'casc-r1', title: '随主会话删除的子代理', cwd: '/tmp', trashedAt: new Date().toISOString(), sizeBytes: 64, origin: 'subagent', cascadeOf: 'session-root' },
+  ]
+  const html = renderToString(h(SettingsPage, { close: () => {}, currentId: 'x', initialTab: 'trash', initialTrash: trash }))
+  assert.ok(html.includes('>子代理</span>'), '回收站的子代理条目应有标记')
+  assert.ok(html.includes('随主会话删除的子代理'), '条目标题')
 })
 
 await test('首次加载：居中过渡动画 + 流式进度计数（已加载 N / M）', () => {

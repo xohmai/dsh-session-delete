@@ -6,14 +6,15 @@
  * 预检，而本服务不答 CORS 预检）：
  *   GET  /api/session-delete/list           全量会话清单（清理面板数据源）
  *   GET  /api/session-delete/preview?id=    单会话删除预览
- *   POST /api/session-delete/delete         { id } 归档 + 移入回收站（保留归档隐藏）
+ *   POST /api/session-delete/delete         { id, cascade? } 归档 + 移入回收站（默认连带全部子代理子会话）
  *   GET  /api/session-delete/trash          回收站清单
- *   POST /api/session-delete/restore        { entry } 原位还原 + 自动解除归档
+ *   POST /api/session-delete/restore        { entry } 原位还原 + 自动解除归档（连带随删的子会话）
  *   POST /api/session-delete/unarchive      { id } 在线解除归档（旧版回退 501）
  *   POST /api/session-delete/purge          { entry? , all? } 彻底删除（保留归档隐藏）
  *
- * 删除流水线（顺序不可换）：
- *   1. 运行保护：agents.get(id) 存在且 status !== 'idle' → 拒绝
+ * 删除流水线（顺序不可换；根会话与级联子会话共用，见 trashOne）：
+ *   1. 运行保护：agents.get(id) 存在且 status !== 'idle' → 拒绝（根会话）/
+ *      跳过并上报（级联子会话，见 deleteSession 的 cascade.skippedRunning）
  *   2. workspaceRegistry.archiveSession(id) —— 必须在文件移动之前调用：
  *      官方实现要求会话「live 或仍在持久化清单中」，归档后宿主会向客户端
  *      广播 host/archived-sessions-changed，侧栏即时隐藏；
@@ -35,6 +36,13 @@
  *      sessions.refresh() 剪掉自己 store 里的残留行（见 client 半）。
  *      live 会话后续的 flush 会因父目录已移走而 ENOENT 失败（append 用
  *      open("a") 但目录不存在），不会在磁盘上重建会话。
+ *   6. 级联（issue #5）：删除任一会话时，以持久化 header 的 parentSession
+ *      为链（核心 SessionHeader 契约字段，创建时校验、随会话落盘）BFS 收集
+ *      全部后代子代理会话，逐个走同一条流水线移入回收站（meta.json 记
+ *      cascadeOf=<根 id>，审计行同）；运行中的后代跳过并在响应里上报。
+ *      restore 对称：还原某会话时，回收站里 cascadeOf 指向它的条目一并
+ *      还原。历史孤儿（父已不在磁盘、子仍在）由 /list 的 orphan 标记暴露，
+ *      供用户过滤后手动清理——启动时绝不自动删数据。
  *
  * 审计：<DSH_HOME>/trash/sessions/audit.log（JSONL 追加）。
  *
@@ -224,6 +232,66 @@ export function apply(ctx) {
     const headers = await listHeaders()
     const byId = new Map(headers.map((h) => [h.id, h]))
     return { headers, byId }
+  }
+
+  /**
+   * parentSession 链索引（issue #5 级联删除的数据源）。
+   *
+   * 核心 SessionHeader 契约：parentSession 是创建时校验、随会话头持久化的
+   * SessionId（见 dsh-agent CreateAgentOptions.meta / dsh-session 头部校验），
+   * 因此「header.parentSession === 某会话 id」是磁盘上可依赖的父子链，无需
+   * 解压 transcript 找 subagent/catalog 事件。自指 / 缺失字段忽略。
+   */
+  function childrenIndex(byId) {
+    const childrenOf = new Map()
+    for (const h of byId.values()) {
+      const p = h.parentSession
+      if (typeof p !== 'string' || p === '' || p === h.id) continue
+      if (!childrenOf.has(p)) childrenOf.set(p, [])
+      childrenOf.get(p).push(h)
+    }
+    return childrenOf
+  }
+
+  /** BFS 收集 rootId 的全部后代 header（传递闭包，环状脏数据由 seen 挡住）。 */
+  function descendantsFrom(childrenOf, rootId) {
+    const out = []
+    const seen = new Set([rootId])
+    const queue = [...(childrenOf.get(rootId) ?? [])]
+    while (queue.length > 0) {
+      const h = queue.shift()
+      if (seen.has(h.id)) continue
+      seen.add(h.id)
+      out.push(h)
+      queue.push(...(childrenOf.get(h.id) ?? []))
+    }
+    return out
+  }
+
+  /**
+   * 血缘视图（list/preview/流式清单共用）：
+   *   counts   id → 后代数（含传递；自底向顶记忆化，环状脏数据回边按 0 计）
+   *   orphanIds 父会话已不在磁盘清单的会话（历史级联缺失留下的孤儿，issue #5；
+   *            只标记供 UI 过滤清理，绝不在启动时自动删除）
+   */
+  function lineageOf(byId) {
+    const childrenOf = childrenIndex(byId)
+    const counts = new Map()
+    const countOf = (id) => {
+      if (counts.has(id)) return counts.get(id)
+      // 先占位 0：环上回边读到 0，防无限递归（真实数据 delegationDepth 有界）
+      counts.set(id, 0)
+      let n = 0
+      for (const h of childrenOf.get(id) ?? []) n += 1 + countOf(h.id)
+      counts.set(id, n)
+      return n
+    }
+    for (const id of byId.keys()) countOf(id)
+    const orphanIds = new Set()
+    for (const h of byId.values()) {
+      if (typeof h.parentSession === 'string' && h.parentSession !== '' && !byId.has(h.parentSession)) orphanIds.add(h.id)
+    }
+    return { childrenOf, counts, orphanIds }
   }
 
   function agentState(id) {
@@ -526,7 +594,7 @@ export function apply(ctx) {
    * 阶段 3：单个会话记录产出（list/preview/list-stream 共用）。
    * prep（阶段 1）+ titles（阶段 2）已就绪，这里只补体积/mtime 并组装。
    */
-  async function buildRecord(p, archived, titles) {
+  async function buildRecord(p, archived, titles, lineage) {
     let title
     let sizeBytes
     let mtimeMs
@@ -548,6 +616,11 @@ export function apply(ctx) {
       createdAt: p.header.createdAt ?? null,
       origin: p.header.origin ?? null,
       delegationDepth: p.header.delegationDepth ?? 0,
+      parentSession: p.header.parentSession ?? null,
+      // 后代子代理数（含传递）：UI 据此提示「删除将连带 N 个子代理会话」
+      subagents: lineage?.counts.get(p.id) ?? 0,
+      // 父会话已不在磁盘：历史删除留下的孤儿（issue #5），UI 供过滤清理
+      orphan: lineage?.orphanIds.has(p.id) ?? false,
       title,
       archived: archived.has(p.id),
       live: p.agent.live,
@@ -561,12 +634,12 @@ export function apply(ctx) {
    * 并发池：limit 个 worker 抢占 prep 队列，每个记录算完立即回调 onRecord。
    * 流式路由据此逐个推送；sessionRecords 据此收集后统一排序。
    */
-  async function eachRecord(preps, archived, titles, limit, onRecord) {
+  async function eachRecord(preps, archived, titles, limit, onRecord, lineage) {
     let index = 0
     const worker = async () => {
       while (index < preps.length) {
         const prep = preps[index++]
-        await onRecord(await buildRecord(prep, archived, titles))
+        await onRecord(await buildRecord(prep, archived, titles, lineage))
       }
     }
     const width = Math.max(1, Math.min(limit, preps.length))
@@ -577,13 +650,14 @@ export function apply(ctx) {
   async function sessionRecords(ids) {
     const { byId } = await inventory()
     const archived = archivedSet()
+    const lineage = lineageOf(byId)
     const target = (ids ?? [...byId.keys()]).filter((id) => byId.has(id))
     const preps = await prepRecords(target, byId)
     const { titles } = await resolveTitles(preps)
     const records = []
     await eachRecord(preps, archived, titles, 16, (record) => {
       records.push(record)
-    })
+    }, lineage)
     records.sort((a, b) => b.mtimeMs - a.mtimeMs)
     return records
   }
@@ -592,23 +666,23 @@ export function apply(ctx) {
   // 删除 / 还原 / 清空
   // -------------------------------------------------------------------------
 
-  async function deleteSession(id) {
-    if (typeof id !== 'string' || !ID_RE.test(id)) throw httpError(400, 'INVALID_ID', '会话 id 非法')
+  /**
+   * 单会话入回收站流水线（根会话与级联子会话共用；步骤与不变式见文件头）。
+   * cascadeOf：本次删除由哪个根会话触发（根自身为 null）——写入回收站
+   * meta.json 与审计行，restore 据此把同批入站的子会话一并带回去。
+   * title 由调用方预算好传入（级联时一次 titlesFor 批量覆盖全部后代，
+   * 避免逐个单调用的平方级陷阱，见 resolveTitles 注释）。
+   */
+  async function trashOne(id, header, { cascadeOf = null, title = null } = {}) {
     // 条目名在动手之前算好并校验：id 经转义后若仍越界（极端长 id 转义膨胀），
     // 直接拒绝删除——绝不制造「已归档但没删成」的中间态或不可还原的回收站条目。
     const entry = `${entryStamp()}-${encodeEntrySegment(id)}`
     if (!ENTRY_RE.test(entry)) {
       throw httpError(400, 'INVALID_ID', '会话 id 转义后条目名过长，无法安全移入回收站')
     }
-    const { byId } = await inventory()
-    const header = byId.get(id)
-    if (header === undefined) throw httpError(404, 'NOT_FOUND', `会话 ${id} 不存在于磁盘记录（可能已删除）`)
-
-    const agent = agentState(id)
-    if (agent.running) throw httpError(409, 'RUNNING', '会话正在运行（模型或子代理未结束），请稍后再试')
 
     // 归档必须在文件移动之前：官方 sessionKnown 检查 live 或仍在持久化清单。
-    // 已归档是幂等 no-op；此时会话一定 known（上面刚在清单里找到）。
+    // 已归档是幂等 no-op；调用方保证此刻会话一定 known（刚在清单里找到）。
     try {
       await ctx.workspaceRegistry.archiveSession(id)
     } catch (error) {
@@ -623,22 +697,13 @@ export function apply(ctx) {
     if ((await stat(dir).catch(() => undefined)) === undefined) {
       // 目录已不存在（例如此前删了一半）：归档已完成，直接视为成功。
       const keptHidden = archivedSet().has(id)
-      await audit('delete', { id, note: 'dir-missing', keptHidden })
+      await audit('delete', { id, note: 'dir-missing', keptHidden, ...(cascadeOf ? { cascadeOf } : {}) })
       // 通知所有客户端从会话列表 store 里移除该行（typert emit 广播；
       // mock/旧版 ctx 无 emit 时静默跳过）。
       ctx.emit?.('api-session/removed', id)
       return { id, ok: true, note: 'dir-missing', keptHidden }
     }
     const sizeBytes = await dirSize(dir)
-    // 标题随会话进回收站：缓存优先（清理面板刚读过清单），缺失时单独折叠一次。
-    // 回收站据此显示会话名而非一串 session-id；旧条目无 title 时客户端回退显示 id。
-    let title = null
-    const cachedRec = recordCache.get(id)
-    if (typeof cachedRec?.title === 'string') title = cachedRec.title
-    else {
-      const titles = await titlesFor([id])
-      if (typeof titles.get(id) === 'string') title = titles.get(id)
-    }
 
     const root = await trashRoot()
     const entryDir = join(root, entry)
@@ -657,6 +722,11 @@ export function apply(ctx) {
           id,
           title,
           cwd: header.cwd ?? null,
+          // 血缘随会话入站（issue #5）：cascadeOf 标记本条目由哪次级联删除带入，
+          // restore 据此连带还原；parentSession/origin 供回收站 UI 标记子代理条目。
+          ...(cascadeOf ? { cascadeOf } : {}),
+          ...(header.parentSession === undefined ? {} : { parentSession: header.parentSession }),
+          ...(header.origin === undefined ? {} : { origin: header.origin }),
           trashedAt: new Date().toISOString(),
           sizeBytes,
           plugin: 'dsh-session-delete',
@@ -671,7 +741,7 @@ export function apply(ctx) {
     // 或宿主内存里的活会话（live）重新显示回侧栏。ghost 待宿主重启时由
     // reconcileArchivedGhosts 统一清理。
     const keptHidden = archivedSet().has(id)
-    await audit('delete', { id, entry, keptHidden })
+    await audit('delete', { id, entry, keptHidden, ...(cascadeOf ? { cascadeOf } : {}) })
     // 关键修复：显式广播 api-session/removed，让 typert 协议把「会话已删除」
     // 推给所有客户端，客户端据此把残留行从 list store 里剪掉——没有这一步，
     // 冷会话被删后宿主不发任何帧，行会一直留在侧栏（点开即 session/not-found）。
@@ -679,6 +749,63 @@ export function apply(ctx) {
     ctx.emit?.('api-session/removed', id)
     recordCache.delete(id)
     return { id, ok: true, entry, keptHidden }
+  }
+
+  /**
+   * 删除会话（issue #5 起默认级联）：除根会话本身外，以 parentSession 链
+   * BFS 收集全部后代子代理会话，逐个走同一条 trashOne 流水线移入回收站。
+   * 运行中的后代跳过（不阻塞整批）并在 cascade.skippedRunning 上报；单个
+   * 后代失败不回滚已完成的删除，记入 cascade.failed。根会话自身运行中仍是
+   * 硬拒绝（409），与单删语义一致。cascade: false 时退回旧行为（只删根）。
+   */
+  async function deleteSession(id, opts = {}) {
+    if (typeof id !== 'string' || !ID_RE.test(id)) throw httpError(400, 'INVALID_ID', '会话 id 非法')
+    const cascade = opts.cascade !== false
+    const { byId } = await inventory()
+    const header = byId.get(id)
+    if (header === undefined) throw httpError(404, 'NOT_FOUND', `会话 ${id} 不存在于磁盘记录（可能已删除）`)
+
+    const agent = agentState(id)
+    if (agent.running) throw httpError(409, 'RUNNING', '会话正在运行（模型或子代理未结束），请稍后再试')
+
+    const descendants = cascade ? descendantsFrom(childrenIndex(byId), id) : []
+    const skippedRunning = []
+    const doomed = []
+    for (const h of descendants) {
+      if (agentState(h.id).running) skippedRunning.push(h.id)
+      else doomed.push(h)
+    }
+
+    // 标题一次批量预解析（根 + 全体后代）：recordCache 命中者免解析；miss
+    // 合并成单次 readTitleSnapshots——逐会话单调用会重扫整个持久化清单，
+    // 208 个子会话就是 208 次全表扫（0.5.0 已证实的平方级陷阱）。
+    const titleById = new Map()
+    const missIds = [id, ...doomed.map((h) => h.id)].filter((x) => typeof recordCache.get(x)?.title !== 'string')
+    if (missIds.length > 0) {
+      const folded = await titlesFor(missIds)
+      for (const x of missIds) titleById.set(x, folded.get(x) ?? null)
+    }
+    const titleOf = (x) => {
+      const cached = recordCache.get(x)?.title
+      return typeof cached === 'string' ? cached : titleById.get(x) ?? null
+    }
+
+    const result = await trashOne(id, header, { title: titleOf(id) })
+    const deleted = []
+    const failed = []
+    for (const h of doomed) {
+      try {
+        const r = await trashOne(h.id, h, { cascadeOf: id, title: titleOf(h.id) })
+        deleted.push({ id: h.id, entry: r.entry ?? null })
+      } catch (error) {
+        failed.push({ id: h.id, message: String(error?.message ?? error) })
+      }
+    }
+    if (deleted.length > 0 || skippedRunning.length > 0) {
+      // 级联汇总行（每个子会话仍有各自的 delete 审计行，带 cascadeOf 可查）
+      await audit('delete-cascade', { root: id, deleted: deleted.map((d) => d.id), skippedRunning })
+    }
+    return { ...result, cascade: { deleted, skippedRunning, failed } }
   }
 
   async function listTrash() {
@@ -706,6 +833,10 @@ export function apply(ctx) {
         id: typeof meta?.id === 'string' ? meta.id : entry.name.replace(/^\d+-/, ''),
         title: typeof meta?.title === 'string' && meta.title ? meta.title : null,
         cwd: typeof meta?.cwd === 'string' ? meta.cwd : null,
+        // 血缘标记（issue #5）：cascadeOf = 随哪个主会话一并入站；origin 标记
+        // 子代理条目。旧条目无这些字段 → null，客户端不显示标记。
+        cascadeOf: typeof meta?.cascadeOf === 'string' ? meta.cascadeOf : null,
+        origin: typeof meta?.origin === 'string' ? meta.origin : null,
         trashedAt: typeof meta?.trashedAt === 'string' ? meta.trashedAt : null,
         sizeBytes: await dirSize(join(entryDir, 'data')),
       })
@@ -736,7 +867,8 @@ export function apply(ctx) {
     return dir
   }
 
-  async function restoreSession(entry) {
+  /** 还原单个回收站条目：文件归位 + 自动解档 + api-session/added 广播。 */
+  async function restoreOne(entry) {
     const entryDir = await resolveTrashEntryDir(entry)
     const dataDir = join(entryDir, 'data')
     if ((await stat(dataDir).catch(() => undefined)) === undefined) {
@@ -803,6 +935,30 @@ export function apply(ctx) {
     return { id: meta.id, ok: true, stillArchived }
   }
 
+  /**
+   * 还原回收站条目（issue #5 起支持级联）：先还原条目本身，再把回收站里
+   * cascadeOf 指向它的条目——随它一并删除的子代理会话——逐个带回来，
+   * 与级联删除完全对称：还原主会话即整批 undo。单个子条目失败不回滚其余
+   * （条目留在回收站可重试）。旧条目（无 cascadeOf 字段）行为不变。
+   */
+  async function restoreSession(entry) {
+    const result = await restoreOne(entry)
+    const cascadeRestored = []
+    const kids = (await listTrash()).filter((i) => i.cascadeOf === result.id)
+    for (const kid of kids) {
+      try {
+        const r = await restoreOne(kid.entry)
+        cascadeRestored.push(r.id)
+      } catch {
+        /* 单条失败不回滚整批 */
+      }
+    }
+    if (cascadeRestored.length > 0) {
+      await audit('restore-cascade', { root: result.id, restored: cascadeRestored })
+    }
+    return { ...result, cascadeRestored }
+  }
+
   async function purge(entry, all) {
     const root = await trashRoot()
     if (all) {
@@ -810,7 +966,8 @@ export function apply(ctx) {
       for (const item of items) await rm(join(root, item.entry), { recursive: true, force: true })
       // 归档 id 保留不摘（同 delete，见文件头第 5 步）：运行期间摘除会复活
       // 客户端残留行 / 宿主活会话；ghost 由宿主重启时的 reconcile 统一清理。
-      await audit('purge-all', { count: items.length })
+      // 审计带上全部被清条目的 id（issue #5 第 3 点：被删对象必须可追溯）。
+      await audit('purge-all', { count: items.length, ids: items.map((i) => i.id) })
       return { ok: true, count: items.length }
     }
     const entryDir = await resolveTrashEntryDir(entry)
@@ -953,10 +1110,12 @@ export function apply(ctx) {
         } catch (error) {
           write({ type: 'error', message: String(error?.message ?? error) })
         }
-        // 阶段 3：行快速流出（recordCache 命中者纯组装，miss 者补 dirSize）
+        // 阶段 3：行快速流出（recordCache 命中者纯组装，miss 者补 dirSize）。
+        // lineage 一并带入：行带上 subagents 计数与 orphan 标记（issue #5）。
         const tRows = Date.now()
+        const lineage = lineageOf(byId)
         try {
-          await eachRecord(preps, archived, titles, 16, (record) => write({ type: 'session', session: record }))
+          await eachRecord(preps, archived, titles, 16, (record) => write({ type: 'session', session: record }), lineage)
         } catch (error) {
           write({ type: 'error', message: String(error?.message ?? error) })
         }
@@ -987,7 +1146,11 @@ export function apply(ctx) {
         if (record === undefined) {
           return sendJson(res, 404, { error: { code: 'NOT_FOUND', message: `会话 ${id} 不存在于磁盘记录` } })
         }
-        sendJson(res, 200, { ok: true, session: record })
+        // 级联预览（issue #5）：该会话的全体后代 id——UI 删除前据此提示
+        // 「将连带删除 N 个子代理会话」。运行中的后代同样列出，由删除时跳过。
+        const { byId } = await inventory()
+        const descendants = descendantsFrom(childrenIndex(byId), id).map((h) => h.id)
+        sendJson(res, 200, { ok: true, session: record, descendants })
       }),
     }),
   )
@@ -999,7 +1162,7 @@ export function apply(ctx) {
       handler: guard(async (req, res) => {
         if (req.method !== 'POST') return sendJson(res, 405, { error: { code: 'METHOD', message: 'POST only' } })
         const body = await readBody(req)
-        const result = await deleteSession(body.id)
+        const result = await deleteSession(body.id, { cascade: body.cascade })
         sendJson(res, 200, { ok: true, ...result })
       }),
     }),

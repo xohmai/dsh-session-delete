@@ -152,19 +152,44 @@ window.__ModuleLoader__.load({
     }
 
     // ---------- 批量删除（返回统计与成功 id；命中当前会话时自动切走） ----------
+    /**
+     * 级联感知（issue #5）：服务端默认连带删除所选会话的全部子代理子会话。
+     * - 已随某次级联删除的 id 记入 handled：同批后续显式命中时按已删跳过，
+     *   不再对已消失的会话发无谓请求（否则整批被 404 计成失败）；
+     * - cascaded / skippedRunning 汇总进返回值，供通知展示。
+     */
     async function deleteMany(ids, currentId, onProgress) {
       let ok = 0
       let failed = 0
+      let cascaded = 0
       let message = null
       const okIds = []
+      const skippedRunning = []
+      const handled = new Set()
       let deletedCurrent = false
+      const countId = (id) => {
+        okIds.push(id)
+        if (id === currentId) deletedCurrent = true
+      }
       for (let i = 0; i < ids.length; i += 1) {
         const id = ids[i]
-        try {
-          await post(`${PREFIX}/delete`, { id })
+        if (handled.has(id)) {
           ok += 1
-          okIds.push(id)
-          if (id === currentId) deletedCurrent = true
+          countId(id)
+          if (onProgress) onProgress(i + 1, ids.length)
+          continue
+        }
+        try {
+          const r = await post(`${PREFIX}/delete`, { id })
+          ok += 1
+          countId(id)
+          const casc = r?.cascade ?? {}
+          for (const c of casc.deleted ?? []) {
+            handled.add(c.id)
+            countId(c.id)
+          }
+          cascaded += (casc.deleted ?? []).length
+          skippedRunning.push(...(casc.skippedRunning ?? []))
         } catch (e) {
           failed += 1
           if (message === null) message = `${shortId(id)}：${e?.message ?? e}`
@@ -176,7 +201,7 @@ window.__ModuleLoader__.load({
           workspacesService.startSession()
         } catch {}
       }
-      return { ok, failed, message, okIds }
+      return { ok, failed, message, okIds, cascaded, skippedRunning }
     }
 
     // ---------- 格式化 ----------
@@ -476,6 +501,13 @@ window.__ModuleLoader__.load({
       const sizeById = new Map((list ?? []).map((s) => [s.id, s.sizeBytes ?? 0]))
       const freedOf = (okIds) => okIds.reduce((acc, id) => acc + (sizeById.get(id) ?? 0), 0)
       const at = () => Date.now()
+      /** 级联结果后缀（issue #5）：连带删除数 + 运行中跳过数（无级联时为空串）。 */
+      const cascadeNote = (r) => {
+        const parts = []
+        if (r.cascaded > 0) parts.push(`连带删除 ${r.cascaded} 个子代理会话`)
+        if ((r.skippedRunning ?? []).length > 0) parts.push(`${r.skippedRunning.length} 个子代理运行中已跳过`)
+        return parts.length > 0 ? ` · ${parts.join(' · ')}` : ''
+      }
 
       async function fireSingleDelete(id) {
         setArm(null)
@@ -485,9 +517,9 @@ window.__ModuleLoader__.load({
           const r = await deleteMany([id], currentId)
           if (r.ok > 0) {
             setNotice({
-              kind: 'ok',
+              kind: (r.skippedRunning ?? []).length > 0 ? 'warn' : 'ok',
               title: `已删除「${title || shortId(id)}」`,
-              detail: `已移入回收站（${fmtSize(freedOf(r.okIds))}）· 侧栏已隐藏 · 可在「回收站」页签还原`,
+              detail: `已移入回收站（${fmtSize(freedOf(r.okIds))}）${cascadeNote(r)} · 侧栏已隐藏 · 可在「回收站」页签还原`,
               at: at(),
             })
           } else {
@@ -507,9 +539,9 @@ window.__ModuleLoader__.load({
           const r = await deleteMany(ids, currentId, (done, total) => setProgress({ done, total }))
           if (r.failed === 0) {
             setNotice({
-              kind: 'ok',
+              kind: (r.skippedRunning ?? []).length > 0 ? 'warn' : 'ok',
               title: `已删除 ${r.ok} 个会话 · 释放 ${fmtSize(freedOf(r.okIds))}`,
-              detail: '已移入回收站 · 侧栏已隐藏 · 可在「回收站」页签还原',
+              detail: `已移入回收站${cascadeNote(r)} · 侧栏已隐藏 · 可在「回收站」页签还原`,
               at: at(),
             })
           } else if (r.ok > 0) {
@@ -592,15 +624,17 @@ window.__ModuleLoader__.load({
         setBusy(true)
         try {
           const r = await post(`${PREFIX}/restore`, { entry })
+          // 级联还原（issue #5）：随该会话一并删除的子代理会话被服务端带回来
+          const casc = (r?.cascadeRestored ?? []).length > 0 ? ` · 连带还原 ${r.cascadeRestored.length} 个子代理会话` : ''
           if (r.stillArchived) {
             setNotice({
               kind: 'warn',
               title: `文件已还原（${shortId(r.id ?? '')}）`,
-              detail: '当前 DSH 版本无法在线解除归档；彻底找回见 README 的 unhide 步骤',
+              detail: `当前 DSH 版本无法在线解除归档；彻底找回见 README 的 unhide 步骤${casc}`,
               at: at(),
             })
           } else {
-            setNotice({ kind: 'ok', title: `已还原（${shortId(r.id ?? '')}）`, detail: '已解除归档 · 侧栏原分组立即可见', at: at() })
+            setNotice({ kind: 'ok', title: `已还原（${shortId(r.id ?? '')}）`, detail: `已解除归档 · 侧栏原分组立即可见${casc}`, at: at() })
           }
         } catch (e) {
           setNotice({ kind: 'err', title: '还原失败', detail: String(e?.message ?? e), at: at() })
@@ -715,11 +749,14 @@ window.__ModuleLoader__.load({
       // ---------- 数据视图 ----------
       const sessions = list ?? []
       const archivedSessions = sessions.filter((s) => s.archived)
+      // 孤儿会话数（issue #5）：>0 时「全部会话」工具条出现「孤儿」过滤按钮
+      const orphanCount = sessions.filter((s) => s.orphan).length
       const q = query.trim().toLowerCase()
       const now = Date.now()
       const filteredAll = sessions.filter((s) => {
         if (filter === 'active' && s.archived) return false
         if (filter === 'archived' && !s.archived) return false
+        if (filter === 'orphan' && !s.orphan) return false
         if (filter === 'stale30' && now - (s.mtimeMs ?? 0) < 30 * 86400000) return false
         if (q && !`${s.title ?? ''}\n${s.id}`.toLowerCase().includes(q)) return false
         return true
@@ -832,6 +869,10 @@ window.__ModuleLoader__.load({
             s.running ? h('span', { key: 'r', style: tagStyle(T.err) }, '运行中') : null,
             s.live && !s.running ? h('span', { key: 'lv', style: tagStyle(T.brand) }, '打开中') : null,
             s.origin === 'subagent' ? h('span', { key: 'sa', style: tagStyle(T.warn) }, '子代理') : null,
+            s.subagents > 0
+              ? h('span', { key: 'sc', style: tagStyle(T.brand), title: '删除该会话时会一并移入回收站（可在回收站一并还原）' }, `子会话 ×${s.subagents}`)
+              : null,
+            s.orphan ? h('span', { key: 'or', style: tagStyle(T.err), title: '父会话已不在磁盘：这是历史删除遗留的孤儿会话，可安全删除' }, '孤儿') : null,
             h('span', { key: 'm', title: fmtDate(s.mtimeMs), style: { fontSize: 11, color: T.secondary, flexShrink: 0, width: 64, textAlign: 'right' } }, fmtAgo(s.mtimeMs)),
             h('span', { key: 's', style: { fontSize: 11, color: T.secondary, flexShrink: 0, width: 64, textAlign: 'right', fontVariantNumeric: 'tabular-nums' } }, fmtSize(s.sizeBytes)),
             opts?.restore
@@ -856,7 +897,9 @@ window.__ModuleLoader__.load({
                     onArm: () => setArm(s.id),
                     onFire: () => fireSingleDelete(s.id),
                     busy,
-                    hint: '删除后移入回收站并保持侧栏隐藏，可在「回收站」页签还原',
+                    hint: s.subagents > 0
+                      ? `删除后移入回收站，并连带其 ${s.subagents} 个子代理子会话；均可在「回收站」页签一并还原`
+                      : '删除后移入回收站并保持侧栏隐藏，可在「回收站」页签还原',
                   }),
                 )
               : null,
@@ -891,6 +934,9 @@ window.__ModuleLoader__.load({
               { key: 't', style: { fontSize: 13, color: T.label, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, minWidth: 0 }, title: `${it.title ?? ''}\n${it.id}\n${it.cwd ?? ''}` },
               it.title || it.id,
             ),
+            it.origin === 'subagent'
+              ? h('span', { key: 'sa', style: tagStyle(T.warn), title: it.cascadeOf ? '随主会话一并删除的子代理会话；还原主会话时会一并还原' : '子代理会话' }, '子代理')
+              : null,
             h('span', { key: 'm', title: it.trashedAt ?? '', style: { fontSize: 11, color: T.secondary, flexShrink: 0, width: 64, textAlign: 'right' } }, fmtAgo(it.trashedAt ? Date.parse(it.trashedAt) : 0)),
             h('span', { key: 's', style: { fontSize: 11, color: T.secondary, flexShrink: 0, width: 64, textAlign: 'right', fontVariantNumeric: 'tabular-nums' } }, fmtSize(it.sizeBytes)),
             h(
@@ -1104,7 +1150,7 @@ window.__ModuleLoader__.load({
                 className: 'sd-btn',
                 style: { ...smallBtn, marginLeft: showRestore ? 0 : 'auto', background: selected.size > 0 ? T.err : 'transparent', borderColor: selected.size > 0 ? T.err : T.border, color: selected.size > 0 ? '#fff' : T.label, fontWeight: 600 },
                 disabled: busy || selected.size === 0,
-                title: '删除后移入回收站，可在「回收站」页签还原',
+                title: '删除后移入回收站（各自的子代理子会话会一并移入），可在「回收站」页签还原',
                 onClick: () => (batchDelArmed ? fireBatchDelete([...selected]) : setArm('sel:del')),
               },
               busy ? h('span', { className: 'sd-spin' }, '↻') : null,
@@ -1131,6 +1177,8 @@ window.__ModuleLoader__.load({
               filterBtn('active', '未归档'),
               filterBtn('stale30', '30 天未动'),
               filterBtn('archived', '已归档'),
+              // 孤儿过滤（issue #5）：父会话已删的遗留子会话集中清理入口
+              orphanCount > 0 ? filterBtn('orphan', `孤儿 (${orphanCount})`) : null,
               filterBtn('all', '全部'),
               h('span', { key: 'n', style: { fontSize: 12, color: T.secondary, marginLeft: 'auto' } }, `${filteredAll.length} / ${sessions.length}`),
             ],

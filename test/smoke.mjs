@@ -47,8 +47,8 @@ function locate(header) {
   return { kind: 'jsonl', path: join(sessionsRoot, slug(header.cwd), segOf(header.id), 'session.jsonl.zstd') }
 }
 
-async function createSession(id, cwd, bytes = 128) {
-  const header = { type: 'session', version: 1, id, createdAt: Date.now() - 86400000, delegationDepth: 0, cwd }
+async function createSession(id, cwd, bytes = 128, extra = {}) {
+  const header = { type: 'session', version: 1, id, createdAt: Date.now() - 86400000, delegationDepth: 0, cwd, ...extra }
   headers.push(header)
   const dir = join(sessionsRoot, slug(cwd), segOf(id))
   await mkdir(dir, { recursive: true })
@@ -270,7 +270,7 @@ const P = '/api/session-delete'
       for (const rec of oneShot.body.sessions) {
         const via = streamed.get(rec.id)
         assert.ok(via, `流式应包含 ${rec.id}`)
-        for (const field of ['title', 'cwd', 'archived', 'live', 'running', 'sizeBytes', 'mtimeMs', 'delegationDepth']) {
+        for (const field of ['title', 'cwd', 'archived', 'live', 'running', 'sizeBytes', 'mtimeMs', 'delegationDepth', 'parentSession', 'subagents', 'orphan']) {
           assert.deepStrictEqual(via[field], rec[field], `${rec.id}.${field} 两边应一致`)
         }
       }
@@ -799,6 +799,148 @@ const P = '/api/session-delete'
       await routes.get(`${P}/delete`)(badReq, r)
       assert.equal(r.status, 400)
       assert.equal(r.body.error.code, 'INVALID_BODY')
+    })
+
+    // --- 级联删除 / 孤儿标记 / 级联还原（issue #5） ---
+    await test('级联删除（issue #5）：主会话连全体后代入回收站，运行中的跳过并上报', async () => {
+      // 结构：root ─┬─ childA（空闲）── grandchild
+      //              ├─ childB（运行中 → 跳过）
+      //              └─ childC（空闲）
+      const root = await createSession('session-casc0001-0000-4000-8000-0000000000aa', cwdA, 200)
+      const childA = await createSession('casc-a-11111111-2222-4333-8444-5555555555a1', cwdA, 100, { parentSession: root.id, origin: 'subagent', delegationDepth: 1 })
+      const childB = await createSession('casc-b-22222222-3333-4444-8555-6666666666b2', cwdA, 100, { parentSession: root.id, origin: 'subagent', delegationDepth: 1 })
+      const childC = await createSession('casc-c-33333333-4444-5555-6666-7777777777c3', cwdA, 100, { parentSession: root.id, origin: 'subagent', delegationDepth: 1 })
+      const grand = await createSession('casc-g-44444444-5555-6666-7777-8888888888d4', cwdA, 64, { parentSession: childA.id, origin: 'subagent', delegationDepth: 2 })
+
+      // preview / list 先看血缘暴露：后代清单 + subagents 计数（含传递）
+      const rPrev = res()
+      await routes.get(`${P}/preview`)(get(`${P}/preview?id=${root.id}`), rPrev)
+      assert.equal(rPrev.status, 200)
+      assert.deepEqual(new Set(rPrev.body.descendants), new Set([childA.id, childB.id, childC.id, grand.id]), 'preview 应列出全体后代（含运行中的）')
+      const rL = res()
+      await routes.get(`${P}/list`)(get(`${P}/list`), rL)
+      const rootRow = rL.body.sessions.find((s) => s.id === root.id)
+      assert.equal(rootRow.subagents, 4, 'subagents 应为传递闭包计数')
+      assert.equal(rootRow.orphan, false)
+      const aRow = rL.body.sessions.find((s) => s.id === childA.id)
+      assert.equal(aRow.subagents, 1)
+      assert.equal(aRow.parentSession, root.id)
+
+      running.set(childB.id, true)
+      const r = res()
+      await routes.get(`${P}/delete`)(bodyReq('POST', `${P}/delete`, { id: root.id }), r)
+      assert.equal(r.status, 200, JSON.stringify(r.body))
+      assert.ok(r.body.entry, '根会话应入回收站')
+      assert.deepEqual(
+        new Set(r.body.cascade.deleted.map((d) => d.id)),
+        new Set([childA.id, childC.id, grand.id]),
+        '空闲后代（含孙代）应全部级联删除',
+      )
+      assert.deepEqual(r.body.cascade.skippedRunning, [childB.id], '运行中的后代应跳过并上报')
+      assert.deepEqual(r.body.cascade.failed, [])
+
+      // 磁盘：四个目录已移走；运行中的 childB 保留
+      for (const id of [root.id, childA.id, childC.id, grand.id]) {
+        assert.ok(!(await stat(join(sessionsRoot, slug(cwdA), segOf(id))).then(() => true, () => false)), `${id} 目录应已移走`)
+      }
+      assert.ok(await stat(join(sessionsRoot, slug(cwdA), segOf(childB.id))).then(() => true, () => false), '运行中的子会话应保留')
+
+      // 审计：每个子会话一行 delete（带 cascadeOf）+ 一行汇总
+      const lines = (await readFile(join(home, 'trash', 'sessions', 'audit.log'), 'utf8')).trim().split('\n').map((l) => JSON.parse(l))
+      for (const id of [childA.id, childC.id, grand.id]) {
+        const line = lines.find((l) => l.action === 'delete' && l.id === id)
+        assert.ok(line, `${id} 应有自己的 delete 审计行`)
+        assert.equal(line.cascadeOf, root.id, '子会话审计行应带 cascadeOf')
+      }
+      const summary = lines.find((l) => l.action === 'delete-cascade' && l.root === root.id)
+      assert.ok(summary, '应有 delete-cascade 汇总审计行')
+      assert.deepEqual(new Set(summary.deleted), new Set([childA.id, childC.id, grand.id]))
+      assert.deepEqual(summary.skippedRunning, [childB.id])
+
+      // meta.json 血缘入站；回收站清单暴露 origin/cascadeOf
+      const entry = r.body.cascade.deleted.find((d) => d.id === childA.id).entry
+      const meta = JSON.parse(await readFile(join(home, 'trash', 'sessions', entry, 'meta.json'), 'utf8'))
+      assert.equal(meta.cascadeOf, root.id)
+      assert.equal(meta.origin, 'subagent')
+      assert.equal(meta.parentSession, root.id)
+      const rT = res()
+      await routes.get(`${P}/trash`)(get(`${P}/trash`), rT)
+      const item = rT.body.items.find((i) => i.entry === entry)
+      assert.equal(item.origin, 'subagent')
+      assert.equal(item.cascadeOf, root.id)
+
+      for (const id of [root.id, childA.id, childC.id, grand.id]) headers.splice(headers.findIndex((x) => x.id === id), 1)
+      running.delete(childB.id)
+    })
+
+    await test('cascade:false 只删根会话；父消失后子会话标记为孤儿（issue #5）', async () => {
+      const root = await createSession('session-casc0002-0000-4000-8000-0000000000ab', cwdA, 64)
+      const child = await createSession('casc-o-55555555-6666-4777-8888-9999999999e5', cwdA, 64, { parentSession: root.id, origin: 'subagent' })
+
+      const r = res()
+      await routes.get(`${P}/delete`)(bodyReq('POST', `${P}/delete`, { id: root.id, cascade: false }), r)
+      assert.equal(r.status, 200, JSON.stringify(r.body))
+      assert.deepEqual(r.body.cascade.deleted, [])
+      assert.ok(await stat(join(sessionsRoot, slug(cwdA), segOf(child.id))).then(() => true, () => false), 'cascade:false 时子会话应保留')
+      headers.splice(headers.findIndex((x) => x.id === root.id), 1)
+
+      // 子会话成为孤儿：orphan 标记暴露，供 UI 过滤清理
+      const rL = res()
+      await routes.get(`${P}/list`)(get(`${P}/list`), rL)
+      const row = rL.body.sessions.find((s) => s.id === child.id)
+      assert.equal(row.orphan, true, '父会话不在磁盘后子会话应标记为孤儿')
+      assert.equal(row.subagents, 0)
+
+      // 收尾：删孤儿 + 清空回收站；purge-all 审计应带上全部条目 id（issue #5 第 3 点）
+      const rDel = res()
+      await routes.get(`${P}/delete`)(bodyReq('POST', `${P}/delete`, { id: child.id }), rDel)
+      headers.splice(headers.findIndex((x) => x.id === child.id), 1)
+      const rP = res()
+      await routes.get(`${P}/purge`)(bodyReq('POST', `${P}/purge`, { all: true }), rP)
+      assert.equal(rP.status, 200)
+      const lines = (await readFile(join(home, 'trash', 'sessions', 'audit.log'), 'utf8')).trim().split('\n').map((l) => JSON.parse(l))
+      // audit.log 是追加式：历史测试也写过 purge-all，取最后一条（本次）
+      const purgeLine = lines.filter((l) => l.action === 'purge-all').at(-1)
+      assert.ok(purgeLine.ids.includes(root.id) && purgeLine.ids.includes(child.id), 'purge-all 审计应记录被清条目的 id')
+    })
+
+    await test('级联还原（issue #5）：还原主会话时随删的子会话一并归位', async () => {
+      const root = await createSession('session-casc0003-0000-4000-8000-0000000000ac', cwdA, 64)
+      const c1 = await createSession('casc-r1-66666666-7777-4888-9999-aaaaaaaaaaf6', cwdA, 64, { parentSession: root.id, origin: 'subagent' })
+      const c2 = await createSession('casc-r2-77777777-8888-4999-aaaa-bbbbbbbbbbf7', cwdA, 64, { parentSession: root.id, origin: 'subagent' })
+
+      const rDel = res()
+      await routes.get(`${P}/delete`)(bodyReq('POST', `${P}/delete`, { id: root.id }), rDel)
+      assert.equal(rDel.status, 200)
+      for (const id of [root.id, c1.id, c2.id]) headers.splice(headers.findIndex((x) => x.id === id), 1)
+      const rT = res()
+      await routes.get(`${P}/trash`)(get(`${P}/trash`), rT)
+      assert.equal(rT.body.items.filter((i) => i.cascadeOf === root.id).length, 2, '回收站应有两条带 cascadeOf 的子会话')
+      const rootEntry = rT.body.items.find((i) => i.id === root.id).entry
+
+      // 文件已归位（模拟真实持久化 list() 重新可见），再触发还原
+      headers.push({ type: 'session', version: 1, id: root.id, createdAt: Date.now(), delegationDepth: 0, cwd: cwdA })
+      headers.push({ type: 'session', version: 1, id: c1.id, createdAt: Date.now(), delegationDepth: 1, cwd: cwdA, parentSession: root.id, origin: 'subagent' })
+      headers.push({ type: 'session', version: 1, id: c2.id, createdAt: Date.now(), delegationDepth: 1, cwd: cwdA, parentSession: root.id, origin: 'subagent' })
+      const r = res()
+      await routes.get(`${P}/restore`)(bodyReq('POST', `${P}/restore`, { entry: rootEntry }), r)
+      assert.equal(r.status, 200, JSON.stringify(r.body))
+      assert.deepEqual(new Set(r.body.cascadeRestored), new Set([c1.id, c2.id]), '随删的子会话应一并还原')
+
+      for (const id of [root.id, c1.id, c2.id]) {
+        assert.ok(await stat(join(sessionsRoot, slug(cwdA), segOf(id), 'session.jsonl.zstd')).then(() => true, () => false), `${id} 应已归位`)
+      }
+      const rT2 = res()
+      await routes.get(`${P}/trash`)(get(`${P}/trash`), rT2)
+      assert.equal(rT2.body.items.filter((i) => i.cascadeOf === root.id).length, 0, '子会话条目应随之离站')
+      const lines = (await readFile(join(home, 'trash', 'sessions', 'audit.log'), 'utf8')).trim().split('\n').map((l) => JSON.parse(l))
+      assert.ok(lines.some((l) => l.action === 'restore-cascade' && l.root === root.id), '应有 restore-cascade 审计行')
+
+      // 收尾：重新删掉三个会话并清空回收站，不影响后续用例
+      const rDel2 = res()
+      await routes.get(`${P}/delete`)(bodyReq('POST', `${P}/delete`, { id: root.id }), rDel2)
+      for (const id of [root.id, c1.id, c2.id]) headers.splice(headers.findIndex((x) => x.id === id), 1)
+      await routes.get(`${P}/purge`)(bodyReq('POST', `${P}/purge`, { all: true }), res())
     })
 
     await test('旧版回退：registry 无内部状态机 → 501 + 还原保留归档态', async () => {
